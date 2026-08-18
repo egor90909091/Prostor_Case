@@ -182,38 +182,6 @@ button, input, textarea, select { font: inherit; color: inherit; }
   .crumbs, .top-select { display: none; }
 }
 
-/* Подшапка с сегмент-контролом */
-.subbar {
-  display: flex; align-items: center; gap: 16px;
-  padding: 10px 20px; background: var(--surface);
-  border-bottom: 1px solid var(--line);
-  position: sticky; top: 52px; z-index: 20;
-}
-.segment { display: inline-flex; border: 1px solid var(--brand); border-radius: var(--r-sm); overflow: hidden; }
-.segment button {
-  border: none; background: var(--surface); color: var(--brand);
-  padding: 6px 18px; font-size: 13px; cursor: pointer;
-  transition: background var(--dur-mid) var(--ease-out), color var(--dur-mid) var(--ease-out);
-}
-.segment button + button { border-left: 1px solid var(--brand-100); }
-.segment button:hover { background: var(--brand-50); }
-.segment button.on { background: var(--brand); color: #fff; font-weight: 600; }
-
-.switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; font-size: 13px; color: var(--ink-2); }
-.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-.switch .track {
-  width: 32px; height: 18px; border-radius: 999px; background: #c6cfdd; position: relative;
-  transition: background var(--dur-mid) var(--ease-out);
-}
-.switch .track::after {
-  content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
-  border-radius: 50%; background: #fff; box-shadow: var(--shadow-sm);
-  transition: transform var(--dur-mid) var(--ease-out);
-}
-.switch input:checked + .track { background: var(--brand); }
-.switch input:checked + .track::after { transform: translateX(14px); }
-.switch input:focus-visible + .track { box-shadow: var(--ring); }
-
 main { flex: 1; padding: 20px 24px 60px; max-width: 1440px; width: 100%; margin: 0 auto; }
 
 h1, h2, h3, h4 { color: var(--ink); }
