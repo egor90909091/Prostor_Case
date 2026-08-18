@@ -126,24 +126,47 @@ app.MapPost("/api/v1/tz/documents", async (
         stored = false;
     }
 
-    var savedId = await db.SaveDocumentAsync(
-        body.SessionId, template.TemplateId, productId, companyIds,
-        payload, draft.Readiness, risks, stored ? key : "", ct);
+    SavedDocument saved;
+    try
+    {
+        saved = await db.SaveDocumentAsync(
+            body.SessionId, template.TemplateId, productId, companyIds,
+            payload, draft.Readiness, risks, stored ? key : "", body.ParentTzId, ct);
+    }
+    catch (Exception ex)
+    {
+        // Чаще всего сюда попадают, когда не накачена миграция
+        // 06_document_versions.sql (колонка parent_tz_id отсутствует).
+        // Даём понятное сообщение вместо голого 500.
+        return Results.Json(new
+        {
+            error = "db_error",
+            message = ex.Message,
+            hint = "Возможно, не накачена миграция 06_document_versions.sql. " +
+                   "Выполните: docker compose exec -T db psql -U prostor -d prostor " +
+                   "-f /docker-entrypoint-initdb.d/06_document_versions.sql"
+        }, jsonOptions, statusCode: StatusCodes.Status500InternalServerError);
+    }
 
     return Results.Json(new
     {
-        tzId = savedId,
+        tzId = saved.TzId,
         readiness = draft.Readiness,
         risks = draft.Risks,
         recommendation = draft.Recommendation,
         storageKey = stored ? key : null,
-        downloadUrl = $"/api/v1/tz/documents/{savedId}/file",
-        stored
+        downloadUrl = $"/api/v1/tz/documents/{saved.TzId}/file",
+        stored,
+        parentTzId = body.ParentTzId,
+        version = saved.Version
     }, jsonOptions, statusCode: StatusCodes.Status201Created);
 });
 
 app.MapGet("/api/v1/tz/documents", async (int? limit, TzDb db, CancellationToken ct) =>
     Results.Ok(new { items = await db.ListDocumentsAsync(limit ?? 50, ct) }));
+
+// ---------------------------------------------------------------- документы
+// Отдаём файл через сервис, а не presigned-ссылкой: адрес MinIO во внутренней
 
 app.MapGet("/api/v1/tz/documents/{tzId:guid}", async (Guid tzId, TzDb db, CancellationToken ct) =>
 {
@@ -158,9 +181,33 @@ app.MapGet("/api/v1/tz/documents/{tzId:guid}", async (Guid tzId, TzDb db, Cancel
         readiness = document.Readiness,
         version = document.Version,
         createdAt = document.CreatedAt,
+        parentTzId = document.ParentTzId,
         risks = JsonNode.Parse(document.Risks),
         payload = JsonNode.Parse(document.Payload),
         downloadUrl = $"/api/v1/tz/documents/{tzId}/file"
+    }, jsonOptions);
+});
+
+// Все версии одного ТЗ: корневой документ плюс строки, ссылающиеся на
+// него через parent_tz_id. Используется в конструкторе и на странице
+// «Мои заявки», чтобы показать историю правок.
+app.MapGet("/api/v1/tz/documents/{tzId:guid}/versions", async (
+    Guid tzId, TzDb db, CancellationToken ct) =>
+{
+    var versions = await db.GetDocumentVersionsAsync(tzId, ct);
+    return Results.Json(new
+    {
+        rootTzId = tzId,
+        items = versions.Select(v => new
+        {
+            tzId = v.TzId,
+            version = v.Version,
+            readiness = v.Readiness,
+            createdAt = v.CreatedAt,
+            productName = v.ProductName,
+            objectName = v.ObjectName,
+            downloadUrl = $"/api/v1/tz/documents/{v.TzId}/file"
+        })
     }, jsonOptions);
 });
 
@@ -204,4 +251,4 @@ app.Run();
 public sealed record DraftRequest(Guid? SessionId, string? TemplateId, JsonObject? State);
 
 public sealed record DocumentRequest(
-    Guid? SessionId, string? TemplateId, JsonObject? State, bool? Force);
+    Guid? SessionId, string? TemplateId, JsonObject? State, bool? Force, Guid? ParentTzId);

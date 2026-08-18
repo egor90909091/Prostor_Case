@@ -3,8 +3,9 @@ import type { ReactNode } from 'react'
 import { ChatView } from './ChatView'
 import { ConstructorView } from './ConstructorView'
 import { AnalyticsView } from './AnalyticsView'
+import { DocumentsView } from './DocumentsView'
 
-type Tab = 'chat' | 'constructor' | 'analytics'
+type Tab = 'chat' | 'constructor' | 'documents' | 'analytics'
 
 // Единый источник для обеих навигаций: верхних вкладок на десктопе и нижней
 // панели на телефоне. Список один, поэтому разъехаться они не могут — какая
@@ -40,6 +41,21 @@ const TABS: { key: Tab; label: string; short: string; crumb: string; icon: React
     ),
   },
   {
+    key: 'documents',
+    label: 'Мои заявки',
+    short: 'Заявки',
+    crumb: 'Мои заявки',
+    icon: (
+      <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+        <path
+          d="M5.5 3h9a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+          stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"
+        />
+        <path d="M7.5 7h5M7.5 10h5M7.5 13h3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
     key: 'analytics',
     label: 'Аналитика',
     short: 'Аналитика',
@@ -58,11 +74,21 @@ const TABS: { key: Tab; label: string; short: string; crumb: string; icon: React
 export default function App() {
   const [tab, setTab] = useState<Tab>('chat')
   const [sessionId, setSessionId] = useState<string | null>(null)
+  const [editTzId, setEditTzId] = useState<string | null>(null)
 
   // Единое приложение с общей навигацией: переход из чата в конструктор
   // передаёт идентификатор сессии, а вместе с ним — все данные диалога.
   const openConstructor = (id: string) => {
     setSessionId(id)
+    setEditTzId(null)
+    setTab('constructor')
+  }
+
+  // Открытие ранее сохранённого ТЗ из «Мои заявки» — в отличие от
+  // openConstructor, тут нет sessionId, конструктор грузит state по
+  // editTzId напрямую из БД.
+  const openTzInConstructor = (tzId: string) => {
+    setEditTzId(tzId)
     setTab('constructor')
   }
 
@@ -115,7 +141,14 @@ export default function App() {
         <div hidden={tab !== 'chat'}>
           <ChatView onOpenConstructor={openConstructor} onResetSession={() => setSessionId(null)} />
         </div>
-        {tab === 'constructor' && <ConstructorView sessionId={sessionId} />}
+        {tab === 'constructor' && (
+          <ConstructorView
+            sessionId={sessionId}
+            editTzId={editTzId}
+            onNavigateToDocuments={() => setTab('documents')}
+          />
+        )}
+        {tab === 'documents' && <DocumentsView onOpenInConstructor={openTzInConstructor} />}
         {tab === 'analytics' && <AnalyticsView />}
       </main>
 

@@ -49,16 +49,29 @@ public sealed class TzDb
         return value is int days ? days : null;
     }
 
-    public async Task<Guid> SaveDocumentAsync(
+    public async Task<SavedDocument> SaveDocumentAsync(
         Guid? sessionId, string templateId, string? productId, string[] companyIds,
-        JsonObject payload, int readiness, JsonArray risks, string storageKey, CancellationToken ct)
+        JsonObject payload, int readiness, JsonArray risks, string storageKey,
+        Guid? parentTzId, CancellationToken ct)
     {
-        await using var cmd = _source.CreateCommand("""
+        // Версия считается по двум ключевым группировкам:
+        //   * parent_tz_id — ручные правки в конструкторе: каждая новая
+        //     версия ссылается на исходный tz_id, поэтому ищем max(version)
+        //     по всем строкам с тем же parent_tz_id плюс по самому корню.
+        //   * session_id — ТЗ, собранные из чата: parent_tz_id = NULL,
+        //     обратная совместимость со старым поведением сохраняется.
+        var versionFilter = parentTzId is { } root
+            ? "WHERE parent_tz_id = @root OR tz_id = @root"
+            : "WHERE session_id IS NOT DISTINCT FROM @s";
+
+        await using var cmd = _source.CreateCommand($$"""
             INSERT INTO tz.document
-                (session_id, template_id, product_id, company_ids, payload, readiness, risks, storage_key, version)
+                (session_id, template_id, product_id, company_ids, payload, readiness,
+                 risks, storage_key, version, parent_tz_id)
             VALUES (@s, @t, @p, @c, @pl::jsonb, @r, @rs::jsonb, @k,
-                    (SELECT coalesce(max(version), 0) + 1 FROM tz.document WHERE session_id = @s))
-            RETURNING tz_id
+                    (SELECT coalesce(max(version), 0) + 1 FROM tz.document {{versionFilter}}),
+                    @pt)
+            RETURNING tz_id, version
             """);
         cmd.Parameters.AddWithValue("s", (object?)sessionId ?? DBNull.Value);
         cmd.Parameters.AddWithValue("t", templateId);
@@ -68,14 +81,19 @@ public sealed class TzDb
         cmd.Parameters.AddWithValue("r", readiness);
         cmd.Parameters.Add(new NpgsqlParameter("rs", NpgsqlDbType.Jsonb) { Value = risks.ToJsonString() });
         cmd.Parameters.AddWithValue("k", storageKey);
-        return (Guid)(await cmd.ExecuteScalarAsync(ct))!;
+        cmd.Parameters.AddWithValue("pt", (object?)parentTzId ?? DBNull.Value);
+        if (parentTzId is { } rootId)
+            cmd.Parameters.AddWithValue("root", rootId);
+        await using var rd = await cmd.ExecuteReaderAsync(ct);
+        await rd.ReadAsync(ct);
+        return new SavedDocument(rd.GetGuid(0), rd.GetInt32(1));
     }
 
     public async Task<TzDocument?> GetDocumentAsync(Guid tzId, CancellationToken ct)
     {
         await using var cmd = _source.CreateCommand(
             "SELECT tz_id, session_id, template_id, product_id, payload::text, readiness, " +
-            "       risks::text, version, storage_key, created_at " +
+            "       risks::text, version, storage_key, created_at, parent_tz_id " +
             "FROM tz.document WHERE tz_id = @id");
         cmd.Parameters.AddWithValue("id", tzId);
         await using var rd = await cmd.ExecuteReaderAsync(ct);
@@ -91,7 +109,30 @@ public sealed class TzDb
             rd.GetString(6),
             rd.GetInt32(7),
             rd.IsDBNull(8) ? null : rd.GetString(8),
-            rd.GetDateTime(9));
+            rd.GetDateTime(9),
+            rd.IsDBNull(10) ? null : rd.GetGuid(10));
+    }
+
+    /// <summary>Все версии одного ТЗ: корневой документ и его потомки.</summary>
+    public async Task<List<TzVersionItem>> GetDocumentVersionsAsync(Guid tzId, CancellationToken ct)
+    {
+        var result = new List<TzVersionItem>();
+        await using var cmd = _source.CreateCommand("""
+            SELECT tz_id, version, readiness, created_at,
+                   coalesce(p.name, '—'),
+                   coalesce(payload->>'object', '—')
+            FROM tz.document d
+            LEFT JOIN catalog.product p ON p.product_id = d.product_id
+            WHERE d.tz_id = @id OR d.parent_tz_id = @id
+            ORDER BY d.version ASC
+            """);
+        cmd.Parameters.AddWithValue("id", tzId);
+        await using var rd = await cmd.ExecuteReaderAsync(ct);
+        while (await rd.ReadAsync(ct))
+            result.Add(new TzVersionItem(
+                rd.GetGuid(0), rd.GetInt32(1), rd.GetInt32(2), rd.GetDateTime(3),
+                rd.GetString(4), rd.GetString(5)));
+        return result;
     }
 
     public async Task<List<TzListItem>> ListDocumentsAsync(int limit, CancellationToken ct)
@@ -119,8 +160,15 @@ public sealed class TzDb
 
 public sealed record TzDocument(
     Guid TzId, Guid? SessionId, string TemplateId, string? ProductId, string Payload,
-    int Readiness, string Risks, int Version, string? StorageKey, DateTime CreatedAt);
+    int Readiness, string Risks, int Version, string? StorageKey, DateTime CreatedAt,
+    Guid? ParentTzId);
 
 public sealed record TzListItem(
     Guid TzId, DateTime CreatedAt, int Readiness, string TemplateName,
     string ProductName, string ObjectName, int RisksCount);
+
+public sealed record TzVersionItem(
+    Guid TzId, int Version, int Readiness, DateTime CreatedAt,
+    string ProductName, string ObjectName);
+
+public sealed record SavedDocument(Guid TzId, int Version);

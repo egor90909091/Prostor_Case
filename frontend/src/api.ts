@@ -176,11 +176,12 @@ export async function createTzDocument(
   templateId: string,
   state: any,
   force = false,
+  parentTzId?: string | null,
 ) {
   const response = await fetch('/api/v1/tz/documents', {
     method: 'POST',
     headers: json,
-    body: JSON.stringify({ sessionId, templateId, state, force }),
+    body: JSON.stringify({ sessionId, templateId, state, force, parentTzId: parentTzId ?? null }),
   })
   const body = await response.json()
   return { ok: response.ok, status: response.status, body }
@@ -188,6 +189,28 @@ export async function createTzDocument(
 
 export async function listTzDocuments() {
   const response = await fetch('/api/v1/tz/documents?limit=20')
+  return response.json()
+}
+
+export async function getTzDocument(tzId: string) {
+  const response = await fetch(`/api/v1/tz/documents/${tzId}`)
+  if (!response.ok) throw new Error('ТЗ не найдено')
+  return response.json()
+}
+
+export interface TzVersionItem {
+  tzId: string
+  version: number
+  readiness: number
+  createdAt: string
+  productName: string
+  objectName: string
+  downloadUrl: string
+}
+
+export async function getTzDocumentVersions(tzId: string): Promise<{ rootTzId: string; items: TzVersionItem[] }> {
+  const response = await fetch(`/api/v1/tz/documents/${tzId}/versions`)
+  if (!response.ok) throw new Error('не удалось загрузить версии')
   return response.json()
 }
 

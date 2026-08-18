@@ -13,7 +13,7 @@ public sealed record FieldStatus(
     string Key, string Section, string Title, int Weight, bool Blocking, bool Filled, string? Hint);
 
 public sealed record Draft(
-    string TemplateId, string TemplateName, int Readiness, bool CanGenerate,
+    string TemplateId, string TemplateName, string TypeCode, int Readiness, bool CanGenerate,
     List<FieldStatus> Fields, List<Risk> Risks, JsonArray Sections, string Recommendation);
 
 /// <summary>
@@ -39,6 +39,7 @@ public static class Drafting
         return new Draft(
             template.TemplateId,
             template.Name,
+            template.TypeCode,
             Math.Clamp(readiness, 0, 100),
             canGenerate,
             fields,

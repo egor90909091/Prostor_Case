@@ -476,6 +476,19 @@ export function Readiness({ value }: { value: number }) {
   )
 }
 
+export function DocxIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path
+        d="M5 2.5h6.5L16 7v10.5H5a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5Z"
+        stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"
+      />
+      <path d="M11.5 2.5V7H16" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+      <path d="M6.7 10.5 7.7 14.5 8.9 11 10.1 14.5 11.1 10.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 export function severityLabel(severity: string): string {
   if (severity === 'blocking') return 'критично'
   if (severity === 'warning') return 'внимание'
