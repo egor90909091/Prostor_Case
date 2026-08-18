@@ -60,7 +60,6 @@
   --r-sm: 4px;
   --r-md: 6px;
   --r-lg: 10px;
-  --r-xl: 14px;
   --ring: 0 0 0 3px rgba(0, 69, 150, 0.16);
   --shadow-sm: 0 1px 2px rgba(11, 29, 56, 0.05), 0 1px 3px rgba(11, 29, 56, 0.06);
   --shadow-md: 0 4px 12px rgba(11, 29, 56, 0.08), 0 2px 4px rgba(11, 29, 56, 0.05);
@@ -147,24 +146,24 @@ button, input, textarea, select { font: inherit; color: inherit; }
 }
 .crumbs .sep { color: var(--ink-3); }
 
-.topbar nav { display: flex; gap: 22px; align-items: stretch; height: 52px; margin-left: 4px; }
-.topbar nav button {
+.topbar-nav { display: flex; gap: 22px; align-items: stretch; height: 52px; margin-left: 4px; }
+.topbar-nav button {
   background: none; border: none; border-radius: 0;
   padding: 0 2px; cursor: pointer; color: var(--ink-2); font-size: 13.5px;
   position: relative; white-space: nowrap;
   transition: color var(--dur-mid) var(--ease-out);
 }
-.topbar nav button::after {
+.topbar-nav button::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
   background: var(--brand);
   transform: scaleX(0); transform-origin: center;
   transition: transform var(--dur-mid) var(--ease-out);
 }
-.topbar nav button:hover { color: var(--ink); }
-.topbar nav button:hover::after { transform: scaleX(0.55); }
-.topbar nav button.on { color: var(--ink); font-weight: 600; }
-.topbar nav button.on::after { transform: scaleX(1); }
-.topbar nav button:focus-visible { outline: none; color: var(--brand); }
+.topbar-nav button:hover { color: var(--ink); }
+.topbar-nav button:hover::after { transform: scaleX(0.55); }
+.topbar-nav button.on { color: var(--ink); font-weight: 600; }
+.topbar-nav button.on::after { transform: scaleX(1); }
+.topbar-nav button:focus-visible { outline: none; color: var(--brand); }
 
 .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
 
@@ -181,38 +180,6 @@ button, input, textarea, select { font: inherit; color: inherit; }
 @media (max-width: 1180px) {
   .crumbs, .top-select { display: none; }
 }
-
-/* Подшапка с сегмент-контролом */
-.subbar {
-  display: flex; align-items: center; gap: 16px;
-  padding: 10px 20px; background: var(--surface);
-  border-bottom: 1px solid var(--line);
-  position: sticky; top: 52px; z-index: 20;
-}
-.segment { display: inline-flex; border: 1px solid var(--brand); border-radius: var(--r-sm); overflow: hidden; }
-.segment button {
-  border: none; background: var(--surface); color: var(--brand);
-  padding: 6px 18px; font-size: 13px; cursor: pointer;
-  transition: background var(--dur-mid) var(--ease-out), color var(--dur-mid) var(--ease-out);
-}
-.segment button + button { border-left: 1px solid var(--brand-100); }
-.segment button:hover { background: var(--brand-50); }
-.segment button.on { background: var(--brand); color: #fff; font-weight: 600; }
-
-.switch { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; font-size: 13px; color: var(--ink-2); }
-.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
-.switch .track {
-  width: 32px; height: 18px; border-radius: 999px; background: #c6cfdd; position: relative;
-  transition: background var(--dur-mid) var(--ease-out);
-}
-.switch .track::after {
-  content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
-  border-radius: 50%; background: #fff; box-shadow: var(--shadow-sm);
-  transition: transform var(--dur-mid) var(--ease-out);
-}
-.switch input:checked + .track { background: var(--brand); }
-.switch input:checked + .track::after { transform: translateX(14px); }
-.switch input:focus-visible + .track { box-shadow: var(--ring); }
 
 main { flex: 1; padding: 20px 24px 60px; max-width: 1440px; width: 100%; margin: 0 auto; }
 
@@ -383,8 +350,6 @@ h1, h2, h3, h4 { color: var(--ink); }
   box-shadow: 0 4px 14px rgba(0, 69, 150, 0.28);
 }
 .btn.primary:active:not(:disabled) { transform: scale(0.98); box-shadow: 0 2px 6px rgba(0, 69, 150, 0.25); }
-.btn.accent { background: var(--orange); color: #fff; border-color: var(--orange); font-weight: 600; }
-.btn.accent:hover:not(:disabled) { background: var(--orange-dark); color: #fff; border-color: var(--orange-dark); }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
 .btn.ghost:hover:not(:disabled) { background: var(--bg); color: var(--ink); border-color: transparent; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -713,82 +678,135 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
 .calc-send:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ==========================================================================
-   Модальное окно-мастер (как «Заявка. Шаг 1/3» в макете)
+   Адаптив
+   Десктоп — источник правды по компоновке; ниже только сужения. Нижняя панель
+   вкладок скрыта по умолчанию и включается на телефонах.
    ========================================================================== */
 
-.modal-overlay {
-  position: fixed; inset: 0; z-index: 100;
-  background: rgba(10, 30, 56, 0.55);
-  display: grid; place-items: center; padding: 24px;
-  animation: fade-in var(--dur-mid) var(--ease-out) both;
-}
-.modal {
-  background: var(--surface); border-radius: var(--r-xl); box-shadow: var(--shadow-lg);
-  width: min(620px, 100%); max-height: 88vh; overflow-y: auto;
-  animation: pop-in var(--dur-mid) var(--ease-out) both;
-}
-.modal-head {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 20px 24px 12px;
-}
-.modal-head h3 { margin: 0; font-size: 17px; font-weight: 600; color: var(--ink); }
-.modal-close {
-  border: none; background: none; cursor: pointer; color: var(--ink-3);
-  width: 28px; height: 28px; border-radius: var(--r-sm); display: grid; place-items: center; font-size: 16px;
-}
-.modal-close:hover { background: var(--bg); color: var(--ink); }
-.modal-body { padding: 0 24px 8px; }
-.modal-foot {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 16px 24px 20px; border-top: 1px solid var(--line-2); margin-top: 12px;
+.tabbar { display: none; }
+
+/* ------------------------------------------------------------- планшет */
+@media (max-width: 1024px) {
+  main { padding: 18px 16px 48px; }
+  .kpi { min-width: 148px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
 }
 
-.stepper { display: flex; align-items: center; margin: 4px 0 6px; }
-.stepper .dot {
-  width: 14px; height: 14px; border-radius: 50%; background: var(--line);
-  border: 3px solid var(--surface); box-shadow: 0 0 0 1px var(--line); flex: none;
-}
-.stepper .dot.on { background: var(--brand); box-shadow: 0 0 0 1px var(--brand); }
-.stepper .dot.done { background: var(--brand-300); box-shadow: 0 0 0 1px var(--brand-300); }
-.stepper .line { flex: 1; height: 1px; background: var(--line); }
-.stepper .line.on { background: var(--brand-300); }
-.step-caption { font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 14px; }
+/* ------------------------------------------------------------- телефон */
+@media (max-width: 720px) {
+  /* --- шапка: логотип и название текущего раздела --- */
+  .topbar { gap: 10px; padding: 0 14px; }
+  .topbar-left { gap: 10px; flex: 1; min-width: 0; }
+  .brand { font-size: 13px; }
+  .brand-caret { display: none; }
+  .crumbs {
+    display: flex; min-width: 0; padding-left: 10px;
+    font-size: 13px; color: var(--ink);
+  }
+  .crumbs span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topbar-nav, .topbar-right { display: none; }
 
-.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-@media (max-width: 560px) { .field-row { grid-template-columns: 1fr; } }
-.char-count { text-align: right; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+  /* --- нижняя панель вкладок --- */
+  .tabbar {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+    background: var(--surface); border-top: 1px solid var(--line);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-shadow: 0 -1px 3px rgba(11, 29, 56, 0.05);
+  }
+  .tabbar button {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; min-height: 54px; padding: 6px 4px;
+    border: none; background: none; cursor: pointer;
+    color: var(--ink-3); font-size: 11px; line-height: 1.15;
+    -webkit-tap-highlight-color: transparent;
+    transition: color var(--dur-fast) var(--ease-out);
+  }
+  .tabbar button.on { color: var(--brand); font-weight: 600; }
+  .tabbar-icon { width: 22px; height: 22px; }
+  .tabbar-icon svg { width: 100%; height: 100%; display: block; }
 
-.accordion {
-  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 11px 13px;
-  font-size: 13.5px; color: var(--ink-2); cursor: pointer; margin: 12px 0;
-  display: flex; align-items: center; gap: 8px; background: var(--surface);
-}
-.accordion:hover { border-color: var(--brand-300); }
-.accordion .caret { color: var(--ink-3); font-size: 10px; }
+  /* нижний отступ, чтобы контент не уезжал под панель */
+  main { padding: 14px 12px calc(76px + env(safe-area-inset-bottom, 0px)); }
 
-.dropzone {
-  border: 1px dashed var(--line); border-radius: var(--r-sm); padding: 20px 16px;
-  text-align: center; color: var(--ink-3); font-size: 12.5px; background: var(--surface);
-  transition: border-color var(--dur-mid) var(--ease-out), background var(--dur-mid) var(--ease-out);
-}
-.dropzone:hover { border-color: var(--brand-300); background: var(--brand-50); }
-.dropzone strong { display: block; color: var(--ink-2); font-size: 13.5px; font-weight: 400; margin-bottom: 4px; }
-.dropzone a { color: var(--brand); font-weight: 600; text-decoration: underline; }
+  /* --- общее --- */
+  .constructor h2, .analytics h2 { font-size: 17px; margin-bottom: 12px; }
+  .card { padding: 13px 14px; border-radius: var(--r-md); }
+  .side { padding: 14px; border-radius: var(--r-md); }
+  .chat .side, .side.sticky { position: static; max-height: none; }
+  .chat, .constructor { gap: 14px; }
 
-/* ==========================================================================
-   Карта связей (тёмно-синие ноды на светлом холсте)
-   ========================================================================== */
+  /* iOS зумит страницу при фокусе, если поле мельче 16px */
+  input, textarea, select { font-size: 16px; }
 
-.map-canvas {
-  background: var(--canvas); border: 1px solid var(--line); border-radius: var(--r-lg);
-  position: relative; overflow: hidden; min-height: 420px;
+  /* тач-таргеты: минимум 44px по высоте */
+  .btn { padding: 11px 16px; }
+  .actions .btn { width: 100%; margin-top: 0; }
+  .actions { flex-direction: column; gap: 8px; }
+  .chip { padding: 8px 13px; font-size: 12.5px; }
+
+  /* --- чат --- */
+  .chat-main { min-height: auto; }
+  .msg.user { max-width: 88%; }
+  .composer { gap: 6px; }
+  .composer input { padding: 10px 12px; min-width: 0; }
+  .composer .btn { margin-top: 0; padding: 11px 14px; white-space: nowrap; }
+  .card-head { gap: 8px; }
+  .rank { width: 22px; height: 22px; font-size: 11px; }
+  .score { font-size: 12px; }
+  .snippet { font-size: 13px; }
+  .chat-toolbar { margin-bottom: 8px; }
+
+  /* --- конструктор --- */
+  .checklist.inline { flex-direction: column; gap: 0; }
+  .checklist.inline li { padding: 9px 0; border-bottom: 1px solid var(--line-2); }
+  .checklist.inline li:last-child { border-bottom: none; }
+  .row { gap: 8px; }
+  .row label { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+  .row input[type="date"] { flex: 1; min-width: 0; }
+  .preview-section p { font-size: 13px; }
+  .mini { font-size: 12.5px; }
+
+  /* --- аналитика --- */
+  .kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .kpi { min-width: 0; padding: 12px 14px; }
+  .kpi-value { font-size: 21px; }
+  .grid { grid-template-columns: 1fr; }
+  .bar-row { grid-template-columns: minmax(0, 1fr) 76px 30px; gap: 8px; font-size: 12.5px; }
+  .chart-legend { gap: 8px 12px; }
+
+  /* --- расчёт стоимости --- */
+  .calc-screen { border-radius: var(--r-md); }
+  .calc-subheader { flex-wrap: wrap; gap: 8px; padding: 10px 14px; }
+  .calc-crumbs { font-size: 12px; flex-wrap: wrap; }
+  .calc-tabsbar { flex-direction: column; align-items: stretch; padding: 0 14px; }
+  .calc-tabs { overflow-x: auto; }
+  .calc-tab { margin-right: 18px; padding: 12px 2px; white-space: nowrap; }
+  .calc-tools { padding: 0 0 10px; }
+  .calc-btn { flex: 1; font-size: 12.5px; padding: 9px 10px; }
+  /* Смету не ломаем в карточки — цифры читаются только в колонках.
+     Таблица горизонтально прокручивается внутри своего контейнера. */
+  .calc-table-wrap { border-right: none; border-bottom: 1px solid var(--line); }
+  /* Суммы не должны переноситься по слогам («1 240 / 000») — вместо этого
+     таблица держит минимальную ширину и прокручивается пальцем. */
+  .calc-table { font-size: 12.5px; min-width: 540px; }
+  .calc-table .num { white-space: nowrap; }
+  .calc-table .col-name { min-width: 190px; }
+  .calc-table .col-name.indent { padding-left: 22px; }
+  .calc-table td, .calc-table thead th { padding: 8px 10px; }
+  .calc-chat { min-height: 360px; }
+  .calc-composer { padding: 10px 14px 12px; }
+
 }
-.map-node {
-  background: var(--brand); color: #fff; border-radius: var(--r-md);
-  padding: 8px 12px; font-size: 12px; line-height: 1.3; text-align: center;
-  box-shadow: var(--shadow-sm); border: 1px solid var(--brand-700);
+
+/* --------------------------------------------------- совсем узкие экраны */
+@media (max-width: 380px) {
+  .topbar { padding: 0 12px; gap: 8px; }
+  .brand { font-size: 12px; letter-spacing: 0.02em; }
+  .logo-mark { width: 20px; height: 20px; font-size: 11px; }
+  .crumbs { font-size: 12px; padding-left: 8px; }
+  main { padding-left: 10px; padding-right: 10px; }
+  .kpis { grid-template-columns: 1fr; }
+  .tabbar button { font-size: 10.5px; }
+  .msg.user { max-width: 94%; }
 }
-.map-node .map-node-sub { color: rgba(255, 255, 255, 0.7); font-size: 10.5px; }
-.map-node.root { background: var(--orange); border-color: var(--orange-dark); border-radius: 50%; }
-.map-link { stroke: #b9c8dc; stroke-width: 1.5; fill: none; }
-.map-link.dashed { stroke-dasharray: 4 4; }
