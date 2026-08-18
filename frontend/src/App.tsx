@@ -5,6 +5,14 @@ import { AnalyticsView } from './AnalyticsView'
 
 type Tab = 'chat' | 'constructor' | 'analytics'
 
+// Хлебные крошки шапки: чисто визуальная подпись активного раздела,
+// источник истины по-прежнему один — состояние tab.
+const CRUMBS: Record<Tab, string> = {
+  chat: 'Подбор услуги',
+  constructor: 'Техническое задание',
+  analytics: 'Аналитика',
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('chat')
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -19,9 +27,18 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">
-          ПРОСТОР <span className="muted">· ИИ-агент и конструктор ТЗ</span>
+        <div className="topbar-left">
+          <div className="brand">
+            <span className="logo-mark" aria-hidden="true">П</span>
+            ПРОСТОР
+            <span className="brand-caret" aria-hidden="true">▼</span>
+          </div>
+          <div className="crumbs">
+            <span className="sep">›</span>
+            <span>{CRUMBS[tab]}</span>
+          </div>
         </div>
+
         <nav>
           <button className={tab === 'chat' ? 'on' : ''} onClick={() => setTab('chat')}>
             ИИ-агент поиска
@@ -33,6 +50,15 @@ export default function App() {
             Аналитика
           </button>
         </nav>
+
+        {/* Правый блок шапки: только контекст организации. Профиля и роли нет —
+            авторизация в системе не предусмотрена, показывать имя пользователя
+            было бы обещанием функции, которой не существует. */}
+        <div className="topbar-right">
+          <select className="top-select" defaultValue="ntc" aria-label="Организация">
+            <option value="ntc">НТЦ</option>
+          </select>
+        </div>
       </header>
 
       <main>

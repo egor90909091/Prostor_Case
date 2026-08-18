@@ -34,9 +34,9 @@ interface Overview {
   tzByDay: { day: string; cnt: number }[]
 }
 
-// Палитра для секторов диаграммы: производные от фирменных navy + teal,
-// чтобы графики не выбивались из общего визуального языка продукта.
-const SLICE_COLORS = ['#129c8c', '#17223d', '#3b6fd6', '#9a5b12', '#35a375', '#7a5bd6', '#c05a2f']
+// Палитра для секторов диаграммы: производные от фирменных синего #004596 и
+// оранжевого #e65907, чтобы графики не выбивались из визуального языка бренда.
+const SLICE_COLORS = ['#004596', '#e65907', '#5b90d6', '#f0a35c', '#002855', '#9dbde6', '#a83f05']
 
 const dayLabel = (iso: string) => {
   const [, m, d] = iso.split('-')
@@ -97,29 +97,29 @@ export function AnalyticsView() {
               <AreaChart data={requests} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
                 <defs>
                   <linearGradient id="gRecognized" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#129c8c" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#129c8c" stopOpacity={0.02} />
+                    <stop offset="0%" stopColor="#004596" stopOpacity={0.35} />
+                    <stop offset="100%" stopColor="#004596" stopOpacity={0.02} />
                   </linearGradient>
                   <linearGradient id="gUnrecognized" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#9a5b12" stopOpacity={0.3} />
-                    <stop offset="100%" stopColor="#9a5b12" stopOpacity={0.02} />
+                    <stop offset="0%" stopColor="#e65907" stopOpacity={0.3} />
+                    <stop offset="100%" stopColor="#e65907" stopOpacity={0.02} />
                   </linearGradient>
                 </defs>
-                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#868c95' }} interval="preserveStartEnd"
-                       tickLine={false} axisLine={{ stroke: '#e2e5ea' }} minTickGap={24} />
-                <YAxis tick={{ fontSize: 11, fill: '#868c95' }} tickLine={false} axisLine={false}
+                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#8a93a1' }} interval="preserveStartEnd"
+                       tickLine={false} axisLine={{ stroke: '#dde3ec' }} minTickGap={24} />
+                <YAxis tick={{ fontSize: 11, fill: '#8a93a1' }} tickLine={false} axisLine={false}
                        allowDecimals={false} width={34} />
                 <Tooltip content={<ChartTooltip />} />
                 <Area type="monotone" dataKey="recognized" name="Распознано" stackId="1"
-                      stroke="#129c8c" strokeWidth={2} fill="url(#gRecognized)" />
+                      stroke="#004596" strokeWidth={2} fill="url(#gRecognized)" />
                 <Area type="monotone" dataKey="unrecognized" name="Не распознано" stackId="1"
-                      stroke="#9a5b12" strokeWidth={2} fill="url(#gUnrecognized)" />
+                      stroke="#e65907" strokeWidth={2} fill="url(#gUnrecognized)" />
               </AreaChart>
             </ResponsiveContainer>
           )}
           <Legend items={[
-            { color: '#129c8c', label: 'Распознано' },
-            { color: '#9a5b12', label: 'Не распознано' },
+            { color: '#004596', label: 'Распознано' },
+            { color: '#e65907', label: 'Не распознано' },
           ]} />
         </Panel>
 
@@ -158,8 +158,8 @@ export function AnalyticsView() {
                 <XAxis type="number" hide allowDecimals={false} />
                 <YAxis type="category" dataKey="name" width={150} tick={<TruncatedTick />}
                        tickLine={false} axisLine={false} />
-                <Tooltip content={<ChartTooltip suffix=" запросов" />} cursor={{ fill: '#f5f6f8' }} />
-                <Bar dataKey="cnt" fill="#129c8c" radius={[0, 4, 4, 0]} barSize={16} />
+                <Tooltip content={<ChartTooltip suffix=" запросов" />} cursor={{ fill: '#eaf1f9' }} />
+                <Bar dataKey="cnt" fill="#004596" radius={[0, 4, 4, 0]} barSize={16} />
               </BarChart>
             </ResponsiveContainer>
           )}
@@ -171,12 +171,12 @@ export function AnalyticsView() {
           ) : (
             <ResponsiveContainer width="100%" height={200}>
               <BarChart data={tzTrend} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
-                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#868c95' }} tickLine={false}
-                       axisLine={{ stroke: '#e2e5ea' }} minTickGap={24} interval="preserveStartEnd" />
-                <YAxis tick={{ fontSize: 11, fill: '#868c95' }} tickLine={false} axisLine={false}
+                <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#8a93a1' }} tickLine={false}
+                       axisLine={{ stroke: '#dde3ec' }} minTickGap={24} interval="preserveStartEnd" />
+                <YAxis tick={{ fontSize: 11, fill: '#8a93a1' }} tickLine={false} axisLine={false}
                        allowDecimals={false} width={34} />
-                <Tooltip content={<ChartTooltip suffix=" ТЗ" />} cursor={{ fill: '#f5f6f8' }} />
-                <Bar dataKey="cnt" name="ТЗ" fill="#17223d" radius={[3, 3, 0, 0]} maxBarSize={22} />
+                <Tooltip content={<ChartTooltip suffix=" ТЗ" />} cursor={{ fill: '#eaf1f9' }} />
+                <Bar dataKey="cnt" name="ТЗ" fill="#004596" radius={[3, 3, 0, 0]} maxBarSize={22} />
               </BarChart>
             </ResponsiveContainer>
           )}
@@ -330,7 +330,7 @@ function TruncatedTick({ x, y, payload }: any) {
   const text: string = payload.value ?? ''
   const short = text.length > 22 ? `${text.slice(0, 21)}…` : text
   return (
-    <text x={x} y={y} dy={4} textAnchor="end" fontSize={12} fill="#4a4f57">
+    <text x={x} y={y} dy={4} textAnchor="end" fontSize={12} fill="#4d5665">
       <title>{text}</title>
       {short}
     </text>
