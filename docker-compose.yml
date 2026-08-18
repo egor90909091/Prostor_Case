@@ -61,7 +61,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
       # Эмбеддинги: отдельный endpoint, без ключа по умолчанию (локальный Ollama
       # с bge-m3, поднятый на хосте вне docker compose). Пусто -> детерминированная
-      # заглушка (hashing trick), тот же алгоритм — в etl/embed_offline.py.
+      # заглушка (hashing trick, см. StubEmbedder в Prostor.Chat).
       EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://host.docker.internal:11434/v1}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}

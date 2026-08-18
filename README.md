@@ -80,13 +80,7 @@ docker compose up --build
 ```bash
 ./tests/smoke.sh                                   # сквозной сценарий по API
 psql "$DSN" -v ON_ERROR_STOP=1 -f tests/sql_checks.sql   # проверки данных и ранжирования
-python3 tests/docx_shape_test.py                   # структура выгружаемого .docx
 ```
-
-Отдельно есть `tests/ui_preview_server.py` — тестовый двойник бэкенда на Python:
-ходит в ту же базу через те же SQL-функции и позволяет прогнать интерфейс
-без сборки .NET (удобно для фронтенд-разработки и для проверки правил ТЗ,
-лежащих в БД).
 
 ### Как это выглядит
 
@@ -277,21 +271,13 @@ score = (0.35·опыт_по_услуге + 0.30·(1−загрузка) + 0.25�
 ## Структура репозитория
 
 ```
-db/init/          01 схема · 02 шаблоны ТЗ · 03 данные (генерируется ETL) · 04 функции поиска
-etl/              build_seed.py — xlsx → SQL;  embed_offline.py — эмбеддинги без внешних сервисов
+db/init/          01 схема · 02 шаблоны ТЗ · 03 данные (статичный seed) · 04 функции поиска
 backend/src/
   Prostor.Chat/   агент: slot filling, поиск, ранжирование, стриминг, аналитика, индексатор
   Prostor.Tz/     конструктор: черновик, готовность, риски, сборка docx, MinIO
 frontend/src/     React: чат с блоками, конструктор ТЗ, аналитика
-tests/            smoke.sh · sql_checks.sql · docx_shape_test.py
+tests/            smoke.sh · sql_checks.sql
 docs/             архитектура и решения
-```
-
-Пересобрать данные из другой выгрузки:
-
-```bash
-python3 etl/build_seed.py --src "путь/к/Выгрузка из системы" --out db/init/03_seed.sql
-docker compose down -v && docker compose up --build
 ```
 
 ---

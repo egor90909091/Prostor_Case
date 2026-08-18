@@ -98,43 +98,6 @@ TestResults/
 project.lock.json
 
 # ─────────────────────────────────────────────
-# Python
-# ─────────────────────────────────────────────
-**/__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-*.egg
-.eggs/
-sdist/
-wheels/
-pip-log.txt
-pip-delete-this-directory.txt
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.pyre/
-.pytype/
-.dmypy.json
-dmypy.json
-
-# Virtualenvs
-venv/
-.venv/
-env/
-ENV/
-
-# ─────────────────────────────────────────────
 # Docker (keep Dockerfiles & compose; ignore local state)
 # ─────────────────────────────────────────────
 .docker/

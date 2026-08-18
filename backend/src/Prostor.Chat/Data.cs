@@ -42,7 +42,7 @@ public record EmbeddingCoverage(int Total, int Missing)
 public record ExecutorHit(
     long Rank, string CompanyId, string Name, int Rating, int Experience,
     DateOnly? LastEndDate, int BusyDays, int PeriodDays, string Availability,
-    int LoadPct, bool Subcontract, decimal Score, string[] Reasons);
+    int LoadPct, bool Subcontract, bool IsFallback, decimal Score, string[] Reasons);
 
 public record StageInfo(string Key, string Name, int UsedCount, int? MedianDays, string? Documentation);
 
@@ -395,7 +395,7 @@ public sealed class Db
         var result = new List<ExecutorHit>();
         await using var cmd = _source.CreateCommand(
             "SELECT rank, company_id, name, rating, experience, last_end_date, busy_days, period_days, " +
-            "       availability, load_pct, subcontract, score, reasons " +
+            "       availability, load_pct, subcontract, is_fallback, score, reasons " +
             "FROM ops.find_executors(@p, @f, @t, @s, @n)");
         cmd.Parameters.AddWithValue("p", productId);
         cmd.Parameters.AddWithValue("f", from);
@@ -409,8 +409,8 @@ public sealed class Db
                 rd.GetInt64(0), rd.GetString(1), rd.GetString(2), rd.GetInt32(3), rd.GetInt32(4),
                 rd.IsDBNull(5) ? null : rd.GetFieldValue<DateOnly>(5),
                 rd.GetInt32(6), rd.GetInt32(7), rd.GetString(8), rd.GetInt32(9),
-                rd.GetBoolean(10), rd.GetDecimal(11),
-                rd.IsDBNull(12) ? Array.Empty<string>() : rd.GetFieldValue<string[]>(12)));
+                rd.GetBoolean(10), rd.GetBoolean(11), rd.GetDecimal(12),
+                rd.IsDBNull(13) ? Array.Empty<string>() : rd.GetFieldValue<string[]>(13)));
         }
         return result;
     }

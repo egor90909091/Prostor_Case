@@ -45,7 +45,7 @@ export default function App() {
           отдельно решено в ChatView через localStorage + GET /sessions/{id}.
         */}
         <div hidden={tab !== 'chat'}>
-          <ChatView onOpenConstructor={openConstructor} />
+          <ChatView onOpenConstructor={openConstructor} onResetSession={() => setSessionId(null)} />
         </div>
         {tab === 'constructor' && <ConstructorView sessionId={sessionId} />}
         {tab === 'analytics' && <AnalyticsView />}

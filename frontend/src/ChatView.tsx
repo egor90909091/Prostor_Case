@@ -34,13 +34,20 @@ const WELCOME_MESSAGE: Message = {
   ],
 }
 
-export function ChatView({ onOpenConstructor }: { onOpenConstructor: (sessionId: string) => void }) {
+export function ChatView({
+  onOpenConstructor,
+  onResetSession,
+}: {
+  onOpenConstructor: (sessionId: string) => void
+  onResetSession?: () => void
+}) {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [state, setState] = useState<ChatStateSnapshot | null>(null)
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [confirmingReset, setConfirmingReset] = useState(false)
   const bottom = useRef<HTMLDivElement>(null)
 
   function startNewSession() {
@@ -131,6 +138,17 @@ export function ChatView({ onOpenConstructor }: { onOpenConstructor: (sessionId:
     void run({ text }, text)
   }
 
+  function resetSession() {
+    if (busy) return
+    if (messages.length > 1 && !confirmingReset) {
+      setConfirmingReset(true)
+      return
+    }
+    setConfirmingReset(false)
+    onResetSession?.()
+    void startNewSession()
+  }
+
   const last = messages[messages.length - 1]
   const streaming = busy && last?.role === 'assistant' && last.blocks.length > 0
   const thinking = busy && (!last || last.role !== 'assistant' || last.blocks.length === 0)
@@ -138,6 +156,23 @@ export function ChatView({ onOpenConstructor }: { onOpenConstructor: (sessionId:
   return (
     <div className="chat">
       <div className="chat-main">
+        <div className="chat-toolbar">
+          {confirmingReset && (
+            <>
+              <span className="muted small">Сбросить чат и черновик ТЗ?</span>
+              <button className="btn ghost small" onClick={() => setConfirmingReset(false)}>
+                Отмена
+              </button>
+            </>
+          )}
+          <button
+            className={`btn small ${confirmingReset ? 'primary' : 'ghost'}`}
+            disabled={busy || !sessionId}
+            onClick={resetSession}
+          >
+            {confirmingReset ? 'Подтвердить' : 'Начать заново'}
+          </button>
+        </div>
         {error && <div className="banner error">{error}</div>}
 
         <div className="stream">

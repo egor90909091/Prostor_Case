@@ -430,6 +430,7 @@ $$;
 -- Календарные дни показываем справочно — объединением интервалов, а не
 -- суммой: перекрывающиеся этапы иначе дают дни сверх длины периода.
 -- ---------------------------------------------------------------------
+DROP FUNCTION IF EXISTS ops.find_executors(text, date, date, boolean, int);
 CREATE OR REPLACE FUNCTION ops.find_executors(
     p_product_id text,
     p_from       date,
@@ -450,6 +451,7 @@ RETURNS TABLE (
     load_pct      int,
     active_works  int,
     subcontract   boolean,
+    is_fallback   boolean,
     score         numeric,
     reasons       text[]
 )
@@ -481,7 +483,7 @@ sub AS (                          -- субподряд: опыт в той же
       AND s.company_id NOT IN (SELECT company_id FROM direct)
     GROUP BY s.company_id
 ),
-cand AS (
+matched_cand AS (
     SELECT company_id,
            max(experience)    AS experience,
            max(last_end_date) AS last_end_date,
@@ -489,6 +491,21 @@ cand AS (
     FROM (SELECT * FROM direct UNION ALL SELECT * FROM sub) u
     WHERE company_id IS NOT NULL
     GROUP BY company_id
+),
+-- Ни прямого опыта по услуге, ни опыта в её категории нет ни у одной компании
+-- (данные, не срок — дата периода тут ни при чём). Возврат пустого списка
+-- в этом случае — тупик: заявка требует хотя бы одного исполнителя, а
+-- добавить его вручную неоткуда. Поэтому вместо пустой выдачи откатываемся
+-- на все активные компании без фильтра по опыту, честно помечая это в
+-- reasons и is_fallback — пользователь видит, что подбор не по подтверждённому
+-- опыту, а не думает, что сервис молча всё разрешил.
+cand AS (
+    SELECT company_id, experience, last_end_date, is_sub, false AS is_fallback
+    FROM matched_cand
+    UNION ALL
+    SELECT co.company_id, 0, NULL::date, false, true
+    FROM catalog.company co
+    WHERE co.is_active AND NOT EXISTS (SELECT 1 FROM matched_cand)
 ),
 work AS (                         -- сколько работ идёт параллельно в этом периоде
     SELECT b.company_id, count(DISTINCT b.calc_id)::int AS active_works
@@ -511,6 +528,7 @@ base AS (
            coalesce(c.experience, 0)                       AS experience,
            c.last_end_date,
            c.is_sub,
+           c.is_fallback,
            coalesce(d.busy_days, 0)                        AS busy_days,
            (SELECT days FROM p)                            AS period_days,
            coalesce(w.active_works, 0)                     AS active_works,
@@ -547,8 +565,11 @@ SELECT row_number() OVER (ORDER BY score DESC, name) AS rank,
        round(100 * coalesce(load, 0))::int AS load_pct,
        active_works,
        is_sub,
+       is_fallback,
        score,
        array_remove(ARRAY[
+           CASE WHEN is_fallback
+                THEN 'нет подтверждённого опыта по этой услуге или категории ни у одной компании — общий список активных исполнителей' END,
            CASE WHEN experience > 0
                 THEN 'выполнено работ по этой услуге: ' || experience END,
            CASE WHEN last_end_date IS NOT NULL

@@ -99,6 +99,7 @@ main { flex: 1; padding: 20px 24px 60px; max-width: 1400px; width: 100%; margin:
 @media (max-width: 1000px) { .chat { grid-template-columns: 1fr; } }
 
 .chat-main { display: flex; flex-direction: column; min-height: 70vh; }
+.chat-toolbar { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-bottom: 4px; }
 .stream { flex: 1; display: flex; flex-direction: column; gap: 14px; padding-bottom: 12px; }
 
 .msg { max-width: 100%; animation: fade-slide-up var(--dur-slow) var(--ease-out) both; }
@@ -245,6 +246,8 @@ main { flex: 1; padding: 20px 24px 60px; max-width: 1400px; width: 100%; margin:
 .btn.primary:active:not(:disabled) { transform: translateY(0) scale(0.97); box-shadow: 0 2px 6px rgba(18, 156, 140, 0.3); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn.wide { width: 100%; }
+.btn.ghost { background: transparent; }
+.btn.small { padding: 5px 10px; font-size: 12.5px; margin-top: 0; }
 
 /* Ripple on press */
 .btn::after {

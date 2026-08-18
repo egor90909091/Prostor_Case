@@ -241,6 +241,7 @@ function ExecutorList({ block, disabled, onAction }: Omit<Props, 'onOpenConstruc
               <div className="card-title">
                 {item.name}
                 {item.subcontract && <span className="badge warn">субподряд</span>}
+                {item.isFallback && <span className="badge warn">нет опыта по услуге</span>}
               </div>
               <div className="card-sub">
                 {AVAILABILITY[item.availability] ?? item.availability} · загрузка {item.loadPct}% ·
