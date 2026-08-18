@@ -52,7 +52,7 @@ public sealed class TzDb
     public async Task<SavedDocument> SaveDocumentAsync(
         Guid? sessionId, string templateId, string? productId, string[] companyIds,
         JsonObject payload, int readiness, JsonArray risks, string storageKey,
-        Guid? parentTzId, CancellationToken ct)
+        Guid? parentTzId, string status, CancellationToken ct)
     {
         // Версия считается по двум ключевым группировкам:
         //   * parent_tz_id — ручные правки в конструкторе: каждая новая
@@ -67,10 +67,10 @@ public sealed class TzDb
         await using var cmd = _source.CreateCommand($$"""
             INSERT INTO tz.document
                 (session_id, template_id, product_id, company_ids, payload, readiness,
-                 risks, storage_key, version, parent_tz_id)
+                 risks, storage_key, version, parent_tz_id, status)
             VALUES (@s, @t, @p, @c, @pl::jsonb, @r, @rs::jsonb, @k,
                     (SELECT coalesce(max(version), 0) + 1 FROM tz.document {{versionFilter}}),
-                    @pt)
+                    @pt, @st)
             RETURNING tz_id, version
             """);
         cmd.Parameters.AddWithValue("s", (object?)sessionId ?? DBNull.Value);
@@ -82,6 +82,7 @@ public sealed class TzDb
         cmd.Parameters.Add(new NpgsqlParameter("rs", NpgsqlDbType.Jsonb) { Value = risks.ToJsonString() });
         cmd.Parameters.AddWithValue("k", storageKey);
         cmd.Parameters.AddWithValue("pt", (object?)parentTzId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("st", status);
         if (parentTzId is { } rootId)
             cmd.Parameters.AddWithValue("root", rootId);
         await using var rd = await cmd.ExecuteReaderAsync(ct);
@@ -93,7 +94,7 @@ public sealed class TzDb
     {
         await using var cmd = _source.CreateCommand(
             "SELECT tz_id, session_id, template_id, product_id, payload::text, readiness, " +
-            "       risks::text, version, storage_key, created_at, parent_tz_id " +
+            "       risks::text, version, storage_key, created_at, parent_tz_id, status " +
             "FROM tz.document WHERE tz_id = @id");
         cmd.Parameters.AddWithValue("id", tzId);
         await using var rd = await cmd.ExecuteReaderAsync(ct);
@@ -110,7 +111,8 @@ public sealed class TzDb
             rd.GetInt32(7),
             rd.IsDBNull(8) ? null : rd.GetString(8),
             rd.GetDateTime(9),
-            rd.IsDBNull(10) ? null : rd.GetGuid(10));
+            rd.IsDBNull(10) ? null : rd.GetGuid(10),
+            rd.GetString(11));
     }
 
     /// <summary>Все версии одного ТЗ: корневой документ и его потомки.</summary>
@@ -120,7 +122,8 @@ public sealed class TzDb
         await using var cmd = _source.CreateCommand("""
             SELECT tz_id, version, readiness, created_at,
                    coalesce(p.name, '—'),
-                   coalesce(payload->>'object', '—')
+                   coalesce(payload->>'object', '—'),
+                   status
             FROM tz.document d
             LEFT JOIN catalog.product p ON p.product_id = d.product_id
             WHERE d.tz_id = @id OR d.parent_tz_id = @id
@@ -131,7 +134,7 @@ public sealed class TzDb
         while (await rd.ReadAsync(ct))
             result.Add(new TzVersionItem(
                 rd.GetGuid(0), rd.GetInt32(1), rd.GetInt32(2), rd.GetDateTime(3),
-                rd.GetString(4), rd.GetString(5)));
+                rd.GetString(4), rd.GetString(5), rd.GetString(6)));
         return result;
     }
 
@@ -142,7 +145,8 @@ public sealed class TzDb
             SELECT d.tz_id, d.created_at, d.readiness, t.name,
                    coalesce(p.name, '—'),
                    coalesce(d.payload->>'object', '—'),
-                   jsonb_array_length(d.risks)
+                   jsonb_array_length(d.risks),
+                   d.status
             FROM tz.document d
             JOIN tz.template t ON t.template_id = d.template_id
             LEFT JOIN catalog.product p ON p.product_id = d.product_id
@@ -153,7 +157,7 @@ public sealed class TzDb
         await using var rd = await cmd.ExecuteReaderAsync(ct);
         while (await rd.ReadAsync(ct))
             result.Add(new TzListItem(rd.GetGuid(0), rd.GetDateTime(1), rd.GetInt32(2),
-                rd.GetString(3), rd.GetString(4), rd.GetString(5), rd.GetInt32(6)));
+                rd.GetString(3), rd.GetString(4), rd.GetString(5), rd.GetInt32(6), rd.GetString(7)));
         return result;
     }
 }
@@ -161,14 +165,14 @@ public sealed class TzDb
 public sealed record TzDocument(
     Guid TzId, Guid? SessionId, string TemplateId, string? ProductId, string Payload,
     int Readiness, string Risks, int Version, string? StorageKey, DateTime CreatedAt,
-    Guid? ParentTzId);
+    Guid? ParentTzId, string Status);
 
 public sealed record TzListItem(
     Guid TzId, DateTime CreatedAt, int Readiness, string TemplateName,
-    string ProductName, string ObjectName, int RisksCount);
+    string ProductName, string ObjectName, int RisksCount, string Status);
 
 public sealed record TzVersionItem(
     Guid TzId, int Version, int Readiness, DateTime CreatedAt,
-    string ProductName, string ObjectName);
+    string ProductName, string ObjectName, string Status);
 
 public sealed record SavedDocument(Guid TzId, int Version);

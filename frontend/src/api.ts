@@ -1,7 +1,7 @@
-// Клиент API. Главная особенность — приём хода диалога:
-// это обычный POST, ответ на который сервер отдаёт долгим потоком.
-// EventSource здесь не годится (умеет только GET), поэтому читаем
-// ReadableStream и сами разбираем SSE-кадры.
+// Клиент API. Главная особенность — приём хода диалога: он идёт по
+// WebSocket (/api/v1/chat/sessions/{id}/ws), а не обычным запрос-ответом —
+// сервер стримит события хода (delta/block/state/done) кадрами по мере
+// готовности, а не одним ответом в конце.
 
 export type BlockItem = Record<string, any>
 
@@ -77,10 +77,18 @@ export async function getSession(sessionId: string): Promise<SessionDetail> {
   return response.json()
 }
 
+function wsUrl(path: string): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${window.location.host}${path}`
+}
+
 /**
- * Один ход диалога. Соединение живёт ровно до события done.
+ * Один ход диалога по WebSocket. Соединение открывается заново на каждый
+ * ход и закрывается сразу после события done — так проще всего совместить
+ * с уже существующей идемпотентностью по clientMessageId на сервере, не
+ * городя поверх неё отдельный протокол переподключения на клиенте.
  */
-export async function sendTurn(
+export function sendTurn(
   sessionId: string,
   body: { text?: string; action?: TurnAction },
   handlers: StreamHandlers,
@@ -88,76 +96,67 @@ export async function sendTurn(
 ): Promise<void> {
   const clientMessageId = `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
-  const response = await fetch(`/api/v1/chat/sessions/${sessionId}/turns`, {
-    method: 'POST',
-    headers: { ...json, Accept: 'text/event-stream', 'Idempotency-Key': clientMessageId },
-    body: JSON.stringify({ clientMessageId, ...body }),
-    signal,
-  })
-
-  if (response.status === 409) {
-    handlers.onError?.('Предыдущий запрос ещё выполняется')
-    return
-  }
-  if (!response.ok || !response.body) {
-    handlers.onError?.(`Ошибка соединения (${response.status})`)
-    return
-  }
-
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-
-    // Кадры SSE разделены пустой строкой
-    let split: number
-    while ((split = buffer.indexOf('\n\n')) >= 0) {
-      const frame = buffer.slice(0, split)
-      buffer = buffer.slice(split + 2)
-      dispatch(frame, handlers)
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
     }
-  }
-  handlers.onDone?.()
-}
 
-function dispatch(frame: string, handlers: StreamHandlers) {
-  let event = 'message'
-  const dataLines: string[] = []
+    const socket = new WebSocket(wsUrl(`/api/v1/chat/sessions/${sessionId}/ws`))
+    let settled = false
+    let opened = false
 
-  for (const line of frame.split('\n')) {
-    if (line.startsWith(':')) return           // heartbeat
-    if (line.startsWith('event:')) event = line.slice(6).trim()
-    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
-  }
-  if (dataLines.length === 0) return
+    const finish = () => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', onAbort)
+      handlers.onDone?.()
+      resolve()
+    }
 
-  let payload: any
-  try {
-    payload = JSON.parse(dataLines.join('\n'))
-  } catch {
-    return
-  }
+    const onAbort = () => socket.close()
+    signal?.addEventListener('abort', onAbort)
 
-  switch (event) {
-    case 'delta':
-      handlers.onDelta?.(payload.text ?? '')
-      break
-    case 'block':
-      if (payload.block) handlers.onBlock?.(payload.block)
-      break
-    case 'state':
-      handlers.onState?.(payload)
-      break
-    case 'error':
-      handlers.onError?.(payload.message ?? 'ошибка')
-      break
-    case 'done':
-      break
-  }
+    socket.onopen = () => {
+      opened = true
+      socket.send(JSON.stringify({ clientMessageId, ...body }))
+    }
+
+    socket.onmessage = (ev) => {
+      let frame: { event?: string; data?: any }
+      try {
+        frame = JSON.parse(ev.data)
+      } catch {
+        return
+      }
+      const event = frame.event ?? 'message'
+      const payload = frame.data ?? {}
+
+      switch (event) {
+        case 'delta':
+          handlers.onDelta?.(payload.text ?? '')
+          break
+        case 'block':
+          if (payload.block) handlers.onBlock?.(payload.block)
+          break
+        case 'state':
+          handlers.onState?.(payload)
+          break
+        case 'error':
+          handlers.onError?.(payload.message ?? 'ошибка')
+          break
+        case 'done':
+          socket.close()
+          break
+      }
+    }
+
+    socket.onerror = () => {
+      if (!opened) handlers.onError?.('Ошибка соединения')
+    }
+
+    socket.onclose = () => finish()
+  })
 }
 
 // ------------------------------------------------------------------ ТЗ
@@ -177,11 +176,14 @@ export async function createTzDocument(
   state: any,
   force = false,
   parentTzId?: string | null,
+  asDraft = false,
 ) {
   const response = await fetch('/api/v1/tz/documents', {
     method: 'POST',
     headers: json,
-    body: JSON.stringify({ sessionId, templateId, state, force, parentTzId: parentTzId ?? null }),
+    body: JSON.stringify({
+      sessionId, templateId, state, force, parentTzId: parentTzId ?? null, asDraft,
+    }),
   })
   const body = await response.json()
   return { ok: response.ok, status: response.status, body }
@@ -205,6 +207,7 @@ export interface TzVersionItem {
   createdAt: string
   productName: string
   objectName: string
+  status: 'draft' | 'final'
   downloadUrl: string
 }
 

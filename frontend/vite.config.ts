@@ -9,7 +9,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api/v1/tz': { target: 'http://localhost:8081', changeOrigin: true },
-      '/api/v1': { target: 'http://localhost:8080', changeOrigin: true },
+      '/api/v1': { target: 'http://localhost:8080', changeOrigin: true, ws: true },
     },
   },
 })

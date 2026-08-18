@@ -11,6 +11,7 @@ interface DocRow {
   productName: string
   objectName: string
   risksCount: number
+  status: 'draft' | 'final'
 }
 
 function fmtDate(iso: string): string {
@@ -127,6 +128,7 @@ export function DocumentsView({ onOpenInConstructor }: { onOpenInConstructor: (t
                     {doc.objectName && doc.objectName !== '—' ? ` · ${doc.objectName}` : ''}
                   </div>
                   <div className="doc-row-meta">
+                    {doc.status === 'draft' && <span className="badge draft">Черновик</span>}
                     <span className="badge readiness">Готовность {doc.readiness}%</span>
                     <span className="badge">Рисков: {doc.risksCount}</span>
                   </div>
@@ -187,6 +189,7 @@ export function DocumentsView({ onOpenInConstructor }: { onOpenInConstructor: (t
                         >
                           <span className="version-num">v{v.version}</span>
                           <span className="muted small">{fmtDate(v.createdAt)}</span>
+                          {v.status === 'draft' && <span className="badge draft">Черновик</span>}
                           <span className="badge">Готовность {v.readiness}%</span>
                           <a
                             className="btn small ghost"

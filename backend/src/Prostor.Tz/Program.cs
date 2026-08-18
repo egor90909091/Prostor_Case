@@ -84,11 +84,15 @@ app.MapPost("/api/v1/tz/documents", async (
     var state = body.State ?? new JsonObject();
     var productId = state["productId"]?.GetValue<string>();
     var typicalDays = await db.GetTypicalDaysAsync(productId, ct);
+    var asDraft = body.AsDraft == true;
+    var status = asDraft ? "draft" : "final";
 
     // Повторная валидация на сервере: фронт подсвечивает пробелы для удобства,
-    // но источник правды о готовности — здесь.
+    // но источник правды о готовности — здесь. Черновик по определению может
+    // быть неполным, поэтому гейт по рискам к нему не применяется — так же,
+    // как и при явном force.
     var draft = Drafting.Build(template, state, typicalDays);
-    if (!draft.CanGenerate && body.Force != true)
+    if (!draft.CanGenerate && body.Force != true && !asDraft)
     {
         return Results.Json(new
         {
@@ -131,20 +135,23 @@ app.MapPost("/api/v1/tz/documents", async (
     {
         saved = await db.SaveDocumentAsync(
             body.SessionId, template.TemplateId, productId, companyIds,
-            payload, draft.Readiness, risks, stored ? key : "", body.ParentTzId, ct);
+            payload, draft.Readiness, risks, stored ? key : "", body.ParentTzId, status, ct);
     }
     catch (Exception ex)
     {
-        // Чаще всего сюда попадают, когда не накачена миграция
-        // 06_document_versions.sql (колонка parent_tz_id отсутствует).
-        // Даём понятное сообщение вместо голого 500.
+        // Чаще всего сюда попадают, когда не накачены миграции
+        // 06_document_versions.sql (колонка parent_tz_id) или
+        // 07_document_status.sql (колонка status). Даём понятное
+        // сообщение вместо голого 500.
         return Results.Json(new
         {
             error = "db_error",
             message = ex.Message,
-            hint = "Возможно, не накачена миграция 06_document_versions.sql. " +
-                   "Выполните: docker compose exec -T db psql -U prostor -d prostor " +
-                   "-f /docker-entrypoint-initdb.d/06_document_versions.sql"
+            hint = "Возможно, не накачены миграции 06_document_versions.sql / " +
+                   "07_document_status.sql. Выполните: docker compose exec -T db psql " +
+                   "-U prostor -d prostor -f /docker-entrypoint-initdb.d/06_document_versions.sql " +
+                   "&& docker compose exec -T db psql -U prostor -d prostor " +
+                   "-f /docker-entrypoint-initdb.d/07_document_status.sql"
         }, jsonOptions, statusCode: StatusCodes.Status500InternalServerError);
     }
 
@@ -158,7 +165,8 @@ app.MapPost("/api/v1/tz/documents", async (
         downloadUrl = $"/api/v1/tz/documents/{saved.TzId}/file",
         stored,
         parentTzId = body.ParentTzId,
-        version = saved.Version
+        version = saved.Version,
+        status
     }, jsonOptions, statusCode: StatusCodes.Status201Created);
 });
 
@@ -182,6 +190,7 @@ app.MapGet("/api/v1/tz/documents/{tzId:guid}", async (Guid tzId, TzDb db, Cancel
         version = document.Version,
         createdAt = document.CreatedAt,
         parentTzId = document.ParentTzId,
+        status = document.Status,
         risks = JsonNode.Parse(document.Risks),
         payload = JsonNode.Parse(document.Payload),
         downloadUrl = $"/api/v1/tz/documents/{tzId}/file"
@@ -206,6 +215,7 @@ app.MapGet("/api/v1/tz/documents/{tzId:guid}/versions", async (
             createdAt = v.CreatedAt,
             productName = v.ProductName,
             objectName = v.ObjectName,
+            status = v.Status,
             downloadUrl = $"/api/v1/tz/documents/{v.TzId}/file"
         })
     }, jsonOptions);
@@ -251,4 +261,5 @@ app.Run();
 public sealed record DraftRequest(Guid? SessionId, string? TemplateId, JsonObject? State);
 
 public sealed record DocumentRequest(
-    Guid? SessionId, string? TemplateId, JsonObject? State, bool? Force, Guid? ParentTzId);
+    Guid? SessionId, string? TemplateId, JsonObject? State, bool? Force, Guid? ParentTzId,
+    bool? AsDraft);

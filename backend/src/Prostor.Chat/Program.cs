@@ -1,3 +1,4 @@
+using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -49,6 +50,7 @@ builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
 
 var app = builder.Build();
 app.UseCors();
+app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
 // Индексатор заполняет только строки с embedding IS NULL, поэтому смена модели
 // эмбеддингов сама по себе индекс не пересчитывает: старые векторы останутся
@@ -193,23 +195,110 @@ app.MapPost("/api/v1/chat/sessions/{sessionId:guid}/turns", async (
     var writer = new SseWriter(http.Response);
     await writer.StartAsync(ct);
 
+    using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    turnCts.CancelAfter(TimeSpan.FromSeconds(cfg.TurnTimeoutSeconds));
+
+    using var heartbeat = new Heartbeat(writer, cfg.HeartbeatSeconds, turnCts.Token);
+
+    await RunTurnAsync(sessionId, state, request, turnId, isNew, writer,
+        db, pipeline, log, turnCts.Token, ct);
+});
+
+// ------------------------------------------------- ход диалога: то же самое, но по WebSocket
+// Один сокет обслуживает всю сессию: клиент шлёт по одному ходу за раз текстовым
+// JSON-кадром, события хода идут кадрами в обратную сторону. Сервер по-прежнему
+// ничего не инициирует сам — WebSocket здесь не про server push, а про то, чтобы
+// не открывать новое HTTP-соединение на каждый ход и держать один канал на сессию.
+app.MapGet("/api/v1/chat/sessions/{sessionId:guid}/ws", async (
+    Guid sessionId, HttpContext http, Db db, TurnPipeline pipeline, AppConfig cfg,
+    ILoggerFactory loggerFactory) =>
+{
+    if (!http.WebSockets.IsWebSocketRequest)
+    {
+        http.Response.StatusCode = StatusCodes.Status400BadRequest;
+        return;
+    }
+
+    var log = loggerFactory.CreateLogger("chat-ws");
+    var ct = http.RequestAborted;
+
+    var state = await db.GetStateAsync(sessionId, ct);
+    if (state is null)
+    {
+        http.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
+
+    using var socket = await http.WebSockets.AcceptWebSocketAsync();
+    var sink = new WebSocketEventSink(socket);
+
+    while (socket.State == WebSocketState.Open)
+    {
+        TurnRequest? request;
+        try
+        {
+            request = await ReceiveJsonAsync<TurnRequest>(socket, ct);
+        }
+        catch (WebSocketException)
+        {
+            break;
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+        if (request is null) break;   // клиент закрыл сокет или прислал мусор
+
+        var running = await db.GetRunningTurnAsync(sessionId, ct);
+        if (running is { } activeTurn)
+        {
+            await sink.WriteAsync("error",
+                Json.Write(new
+                {
+                    error = "turn_in_progress",
+                    message = "Предыдущий запрос ещё выполняется",
+                    activeTurnId = activeTurn
+                }), ct);
+            continue;
+        }
+
+        var idempotencyKey = request.ClientMessageId ?? Guid.NewGuid().ToString();
+        var (turnId, isNew) = await db.StartTurnAsync(sessionId, idempotencyKey, ct);
+
+        using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        turnCts.CancelAfter(TimeSpan.FromSeconds(cfg.TurnTimeoutSeconds));
+
+        state = await RunTurnAsync(sessionId, state, request, turnId, isNew, sink,
+            db, pipeline, log, turnCts.Token, ct);
+    }
+
+    // CloseReceived (клиент уже прислал close-кадр, например сразу после done) тоже
+    // нужно закрывать явно — иначе рукопожатие закрытия не завершается и соединение
+    // рвётся резким сбросом вместо штатного close-кадра в ответ.
+    if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+        await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
+});
+
+// Общее тело одного хода для обоих транспортов (SSE и WebSocket): различается
+// только sink, в который пишутся события.
+async Task<ChatState> RunTurnAsync(
+    Guid sessionId, ChatState state, TurnRequest request, Guid turnId, bool isNew,
+    IEventSink sink, Db db, TurnPipeline pipeline, ILogger log,
+    CancellationToken turnCt, CancellationToken connectionCt)
+{
     // Повтор с тем же ключом не выполняет ход второй раз — отдаём сохранённые события
     if (!isNew)
     {
-        var stored = await db.GetTurnAsync(turnId, ct);
+        var stored = await db.GetTurnAsync(turnId, connectionCt);
         if (stored is { } prior)
         {
             foreach (var node in JsonNode.Parse(prior.Events)?.AsArray() ?? new JsonArray())
-                await writer.WriteRawAsync(node?["event"]?.GetValue<string>() ?? "delta",
-                    node?["data"]?.ToJsonString() ?? "{}", ct);
-            await writer.WriteRawAsync("done", Json.Write(new { turnId, replayed = true }), ct);
-            return;
+                await sink.WriteAsync(node?["event"]?.GetValue<string>() ?? "delta",
+                    node?["data"]?.ToJsonString() ?? "{}", connectionCt);
+            await sink.WriteAsync("done", Json.Write(new { turnId, replayed = true }), connectionCt);
+            return state;
         }
     }
-
-    using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-    turnCts.CancelAfter(TimeSpan.FromSeconds(cfg.TurnTimeoutSeconds));
-    var turnCt = turnCts.Token;
 
     var seq = 0;
     async Task EmitAsync(string name, object payload, CancellationToken token)
@@ -222,10 +311,8 @@ app.MapPost("/api/v1/chat/sessions/{sessionId:guid}/turns", async (
             ["data"] = JsonNode.Parse(data)
         };
         await db.AppendTurnEventAsync(turnId, envelope.ToJsonString(), CancellationToken.None);
-        await writer.WriteRawAsync(name, data, token);
+        await sink.WriteAsync(name, data, token);
     }
-
-    using var heartbeat = new Heartbeat(writer, cfg.HeartbeatSeconds, turnCt);
 
     try
     {
@@ -265,7 +352,7 @@ app.MapPost("/api/v1/chat/sessions/{sessionId:guid}/turns", async (
     {
         // Ход дописан в БД независимо от состояния соединения: клиент
         // переподключится на /stream?fromSeq=N и доберёт хвост
-        await db.FinishTurnAsync(turnId, ct.IsCancellationRequested ? "cancelled" : "timeout",
+        await db.FinishTurnAsync(turnId, connectionCt.IsCancellationRequested ? "cancelled" : "timeout",
             CancellationToken.None);
         log.LogInformation("ход {TurnId} прерван", turnId);
     }
@@ -275,14 +362,42 @@ app.MapPost("/api/v1/chat/sessions/{sessionId:guid}/turns", async (
         await db.FinishTurnAsync(turnId, "failed", CancellationToken.None);
         try
         {
-            await writer.WriteRawAsync("error", Json.Write(new { message = "internal_error" }), CancellationToken.None);
+            await sink.WriteAsync("error", Json.Write(new { message = "internal_error" }), CancellationToken.None);
         }
         catch
         {
             // соединение уже закрыто
         }
     }
-});
+
+    return state;
+}
+
+// Читает один полный текстовый WS-кадр (склеивая фрагменты, если браузер разбил
+// сообщение на несколько continuation-кадров) и разбирает его как JSON.
+// Возвращает null, если клиент закрыл соединение или прислал кадр, который не
+// удалось распарсить.
+async Task<T?> ReceiveJsonAsync<T>(WebSocket socket, CancellationToken ct) where T : class
+{
+    using var buffer = new MemoryStream();
+    var chunk = new byte[8192];
+    while (true)
+    {
+        var result = await socket.ReceiveAsync(chunk, ct);
+        if (result.MessageType == WebSocketMessageType.Close) return null;
+        buffer.Write(chunk, 0, result.Count);
+        if (result.EndOfMessage) break;
+    }
+    buffer.Position = 0;
+    try
+    {
+        return await JsonSerializer.DeserializeAsync<T>(buffer, Json.Options, ct);
+    }
+    catch (JsonException)
+    {
+        return null;
+    }
+}
 
 // ----------------------------------------- дострим после обрыва соединения
 app.MapGet("/api/v1/chat/sessions/{sessionId:guid}/turns/{turnId:guid}/stream", async (
@@ -303,12 +418,12 @@ app.MapGet("/api/v1/chat/sessions/{sessionId:guid}/turns/{turnId:guid}/stream", 
     {
         var seq = node?["seq"]?.GetValue<int>() ?? 0;
         if (seq <= start) continue;
-        await writer.WriteRawAsync(node?["event"]?.GetValue<string>() ?? "delta",
+        await writer.WriteAsync(node?["event"]?.GetValue<string>() ?? "delta",
             node?["data"]?.ToJsonString() ?? "{}", http.RequestAborted);
     }
 
     if (turn.Value.Status != "running")
-        await writer.WriteRawAsync("done", Json.Write(new { turnId, resumed = true }), http.RequestAborted);
+        await writer.WriteAsync("done", Json.Write(new { turnId, resumed = true }), http.RequestAborted);
 });
 
 // ---------------------------------------------------------------- каталог
@@ -388,11 +503,15 @@ public sealed record SearchRequest(string? Query, int? TopK);
 public sealed record ExecutorSearchRequest(
     string ProductId, string? From, string? To, bool? AllowSubcontract, int? Top);
 
-/// <summary>
-/// Поток SSE поверх обычного POST. WebSocket не нужен: сервер ничего
-/// не инициирует вне хода пользователя.
-/// </summary>
-public sealed class SseWriter
+/// <summary>Общий приёмник событий хода — общий код в Program.cs пишет в него,
+/// не зная, летит ли событие клиенту по SSE или по WebSocket.</summary>
+public interface IEventSink
+{
+    Task WriteAsync(string eventName, string json, CancellationToken ct);
+}
+
+/// <summary>Поток SSE поверх обычного POST.</summary>
+public sealed class SseWriter : IEventSink
 {
     private readonly HttpResponse _response;
     private readonly SemaphoreSlim _lock = new(1, 1);
@@ -409,7 +528,7 @@ public sealed class SseWriter
         await _response.Body.FlushAsync(ct);
     }
 
-    public async Task WriteRawAsync(string eventName, string json, CancellationToken ct)
+    public async Task WriteAsync(string eventName, string json, CancellationToken ct)
     {
         var frame = Encoding.UTF8.GetBytes($"event: {eventName}\ndata: {json}\n\n");
         await _lock.WaitAsync(ct);
@@ -432,6 +551,34 @@ public sealed class SseWriter
         {
             await _response.Body.WriteAsync(frame, ct);
             await _response.Body.FlushAsync(ct);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+}
+
+/// <summary>Каждое событие хода — один текстовый WS-кадр {"event":..,"data":..}.
+/// В отличие от SSE кадры WebSocket не нужно разделять пустой строкой: границы
+/// сообщений сохраняет сам протокол.</summary>
+public sealed class WebSocketEventSink : IEventSink
+{
+    private readonly WebSocket _socket;
+    private readonly SemaphoreSlim _lock = new(1, 1);
+
+    public WebSocketEventSink(WebSocket socket) => _socket = socket;
+
+    public async Task WriteAsync(string eventName, string json, CancellationToken ct)
+    {
+        if (_socket.State != WebSocketState.Open) return;
+        var envelope = new JsonObject { ["event"] = eventName, ["data"] = JsonNode.Parse(json) };
+        var bytes = Encoding.UTF8.GetBytes(envelope.ToJsonString());
+        await _lock.WaitAsync(ct);
+        try
+        {
+            if (_socket.State != WebSocketState.Open) return;
+            await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
         }
         finally
         {

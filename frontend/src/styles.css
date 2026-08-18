@@ -321,6 +321,7 @@ h1, h2, h3, h4 { color: var(--ink); }
   padding: 1px 6px; font-size: 11px; margin-left: 6px; font-weight: 600;
 }
 .badge.warn { background: var(--warn-soft); color: var(--warn); }
+.badge.draft { background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line); }
 
 .reasons { margin: 8px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 13px; }
 .reasons li { margin: 2px 0; }

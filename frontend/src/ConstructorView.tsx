@@ -93,9 +93,15 @@ export function ConstructorView({
   const [templates, setTemplates] = useState<{ id: string; name: string }[]>([])
   const [availableStages, setAvailableStages] = useState<Stage[]>([])
   const [draft, setDraft] = useState<DraftResponse | null>(null)
-  const [result, setResult] = useState<{ tzId: string; downloadUrl: string; version: number } | null>(null)
+  const [result, setResult] = useState<{
+    tzId: string
+    downloadUrl: string
+    version: number
+    status: 'draft' | 'final'
+  } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [savingDraft, setSavingDraft] = useState(false)
   // Рендер готового .docx в браузере: после сохранения тащим бинарь по
   // downloadUrl и просим docx-preview отрисовать WordprocessingML в DOM.
   // Позволяет пользователю увидеть финальный документ, не уходя в «Мои
@@ -111,6 +117,7 @@ export function ConstructorView({
     version: number
     createdAt: string
     parentTzId?: string | null
+    status?: 'draft' | 'final'
   } | null>(null)
 
   // Предзаполнение конструктора идёт из одного из трёх источников
@@ -143,6 +150,7 @@ export function ConstructorView({
             version: doc.version,
             createdAt: doc.createdAt,
             parentTzId: doc.parentTzId,
+            status: doc.status,
           })
           if (doc.productId) {
             getStages(doc.productId)
@@ -315,8 +323,14 @@ export function ConstructorView({
     }))
   }
 
-  const generate = async () => {
-    setSaving(true)
+  // Общая логика для «Сформировать документ» и «Сохранить черновик»:
+  // обе кнопки создают новую версию того же документа (или корневую
+  // запись, если ТЗ ещё не сохранялось). Разница только в статусе —
+  // черновик сохраняется без гейта по готовности (asDraft на бэкенде
+  // отключает проверку canGenerate).
+  const save = async (asDraft: boolean) => {
+    const setBusy = asDraft ? setSavingDraft : setSaving
+    setBusy(true)
     setError(null)
     // В режиме редактирования сохраняем как новую версию. parentTzId
     // всегда указывает на КОРЕНЬ цепочки (а не на текущую версию): если
@@ -325,24 +339,25 @@ export function ConstructorView({
     // root и попадают в один список через GetDocumentVersionsAsync.
     // Для корневого документа (parentTzId = null) корень — он сам.
     const rootTzId = editing ? (editing.parentTzId ?? editing.tzId) : null
-    const response = await createTzDocument(sessionId, templateId, state, false, rootTzId)
-    setSaving(false)
+    const response = await createTzDocument(sessionId, templateId, state, false, rootTzId, asDraft)
+    setBusy(false)
     if (response.ok) {
+      const status: 'draft' | 'final' = response.body.status ?? (asDraft ? 'draft' : 'final')
       setResult({
         tzId: response.body.tzId,
         downloadUrl: response.body.downloadUrl,
         version: response.body.version,
+        status,
       })
-      if (rootTzId) {
-        setEditing({
-          tzId: response.body.tzId,
-          version: response.body.version,
-          createdAt: new Date().toISOString(),
-          // Корень цепочки не меняется при следующих сохранениях —
-          // новая версия тоже ссылается на него.
-          parentTzId: rootTzId,
-        })
-      }
+      setEditing({
+        tzId: response.body.tzId,
+        version: response.body.version,
+        createdAt: new Date().toISOString(),
+        // Корень цепочки не меняется при следующих сохранениях —
+        // новая версия тоже ссылается на него.
+        parentTzId: rootTzId ?? response.body.tzId,
+        status,
+      })
     } else if (response.status === 422) {
       setError('ТЗ не готово к выгрузке: устраните критичные риски')
     } else if (response.status === 500) {
@@ -352,9 +367,12 @@ export function ConstructorView({
       setError(errBody?.hint ?? errBody?.message ?? 'Ошибка сервера')
     } else {
       const errBody = response.body as any
-      setError(errBody?.message ?? 'Не удалось сформировать документ')
+      setError(errBody?.message ?? 'Не удалось сохранить ТЗ')
     }
   }
+
+  const generate = () => save(false)
+  const saveDraft = () => save(true)
 
   const chosenKeys = useMemo(
     () => new Set((state.stages ?? []).map((s: any) => s.key)),
@@ -376,7 +394,8 @@ export function ConstructorView({
         <h2>Конструктор технического задания</h2>
         {editing && (
           <div className="banner">
-            Редактируется ТЗ v{editing.version} от {new Date(editing.createdAt).toLocaleString('ru-RU')}.
+            {editing.status === 'draft' && <span className="badge draft">Черновик</span>}
+            {' '}Редактируется ТЗ v{editing.version} от {new Date(editing.createdAt).toLocaleString('ru-RU')}.
             Сохранение создаст новую версию этого документа.
           </div>
         )}
@@ -591,7 +610,9 @@ export function ConstructorView({
         {result && (
           <section className="card">
             <div className="card-title">
-              Готовый документ{result.version ? ` · v${result.version}` : ''}
+              {result.status === 'draft' && <span className="badge draft">Черновик</span>}{' '}
+              {result.status === 'draft' ? 'Сохранённый черновик' : 'Готовый документ'}
+              {result.version ? ` · v${result.version}` : ''}
             </div>
             <div className="card-sub">
               Так документ будет выглядеть в Word. Можно скачать{onNavigateToDocuments ? ' или перейти к списку заявок.' : '.'}
@@ -652,9 +673,22 @@ export function ConstructorView({
           <p className="muted small">Кнопка разблокируется, когда не останется критичных рисков.</p>
         )}
 
+        {/* Черновик можно сохранить в любой момент, даже если форма не
+            заполнена до конца, — без гейта по рискам, в отличие от
+            «Сформировать документ». Удобно фиксировать промежуточный
+            результат и вернуться к нему позже из «Мои заявки». */}
+        <button
+          type="button"
+          className="btn wide"
+          disabled={savingDraft}
+          onClick={() => void saveDraft()}
+        >
+          {savingDraft ? 'Сохраняю…' : 'Сохранить черновик'}
+        </button>
+
         {result && (
           <div className="card success">
-            <strong>ТЗ сформировано</strong>
+            <strong>{result.status === 'draft' ? 'Черновик сохранён' : 'ТЗ сформировано'}</strong>
             <a className="btn" href={result.downloadUrl}>Скачать .docx</a>
           </div>
         )}
