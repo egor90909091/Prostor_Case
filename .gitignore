@@ -1,0 +1,148 @@
+# ─────────────────────────────────────────────
+# OS files
+# ─────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ─────────────────────────────────────────────
+# Editors & IDEs
+# ─────────────────────────────────────────────
+.idea/
+.vs/
+.vscode/
+*.ide/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# ─────────────────────────────────────────────
+# Secrets & environment (keep .env.example)
+# ─────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# ─────────────────────────────────────────────
+# Logs & runtime
+# ─────────────────────────────────────────────
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+pids/
+
+# ─────────────────────────────────────────────
+# Node.js / Vite / React / TypeScript
+# ─────────────────────────────────────────────
+**/node_modules/
+**/dist/
+**/build/
+*.tsbuildinfo
+.vite/
+coverage/
+.nyc_output/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+*.local
+.eslintcache
+
+# ─────────────────────────────────────────────
+# .NET / C#
+# ─────────────────────────────────────────────
+**/bin/
+**/obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa]pp[Pp]ackages/
+*.pdb
+*.cache
+*.dll.config
+TestResults/
+[Bb]uild[Ll]og.*
+*.VisualState.xml
+*.pubxml
+*.pubxml.user
+*.publishsettings
+*.azurePubxml
+*.nuget.props
+*.nuget.targets
+project.lock.json
+
+# ─────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+sdist/
+wheels/
+pip-log.txt
+pip-delete-this-directory.txt
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.dmypy.json
+dmypy.json
+
+# Virtualenvs
+venv/
+.venv/
+env/
+ENV/
+
+# ─────────────────────────────────────────────
+# Docker (keep Dockerfiles & compose; ignore local state)
+# ─────────────────────────────────────────────
+.docker/
+
+# ─────────────────────────────────────────────
+# Caches & temp
+# ─────────────────────────────────────────────
+.cache/
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
