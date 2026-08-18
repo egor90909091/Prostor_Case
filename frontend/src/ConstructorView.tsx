@@ -21,6 +21,7 @@ interface FieldStatus {
   key: string
   title: string
   weight: number
+  blocking: boolean
   filled: boolean
   hint?: string
 }
@@ -45,16 +46,20 @@ interface DraftResponse {
   sections: Section[]
 }
 
-const TEXT_FIELDS: { key: string; title: string; placeholder: string; rows?: number }[] = [
-  { key: 'customer', title: 'Заказчик', placeholder: 'Полное наименование ДО-заказчика' },
-  { key: 'object', title: 'Объект работ', placeholder: 'Месторождение, лицензионный участок' },
-  { key: 'purpose', title: 'Цели и задачи', placeholder: 'Что нужно получить по итогам работ', rows: 3 },
-  { key: 'perimeter', title: 'Периметр работ', placeholder: 'Пласты, залежи, скважины, объём', rows: 2 },
-  { key: 'sourceData', title: 'Требования к исходным данным', placeholder: 'Что предоставляет заказчик', rows: 2 },
-  { key: 'documentation', title: 'Требования к документации', placeholder: 'Состав и формат отчётных материалов', rows: 2 },
-  { key: 'acceptance', title: 'Порядок приёмки', placeholder: 'Кто и как принимает результат', rows: 2 },
-  { key: 'other', title: 'Иные условия', placeholder: 'Дополнительные требования', rows: 2 },
-]
+// Поля, у которых в конструкторе уже есть отдельный специализированный
+// виджет (даты, чек-листы этапов) — их не нужно повторно рисовать как
+// обычный текстовый инпут, даже если шаблон включает их в required_fields.
+const DEDICATED_WIDGET_KEYS = new Set(['period', 'stages', 'operations', 'executors'])
+
+// Ключ поля в required_fields не всегда совпадает с именем свойства в
+// state (Drafting.cs на бэкенде читает часть полей по другому имени) —
+// единственное расхождение сегодня: source_data → sourceData.
+const STATE_KEY_OVERRIDES: Record<string, string> = { source_data: 'sourceData' }
+
+// Разделы, которые обычно требуют развёрнутого текста, а не одной строки
+const TEXTAREA_FIELD_KEYS = new Set([
+  'purpose', 'perimeter', 'source_data', 'documentation', 'acceptance', 'other', 'kpi', 'conditions',
+])
 
 export function ConstructorView({ sessionId }: { sessionId: string | null }) {
   const [state, setState] = useState<any>({ flags: {}, stages: [], executors: [], period: {} })
@@ -139,6 +144,15 @@ export function ConstructorView({ sessionId }: { sessionId: string | null }) {
   const chosenKeys = useMemo(
     () => new Set((state.stages ?? []).map((s: any) => s.key)),
     [state.stages],
+  )
+
+  // Набор текстовых полей зависит от выбранного шаблона: тип ТЗ на
+  // «Сопровождение инженерных работ» не покажет «Периметр работ», а тип
+  // на ПТД/ПЗ добавит «Контрольные сроки (КПЭ)» — состав приходит из
+  // required_fields шаблона (tz.template в БД), а не зашит на фронте.
+  const textFields = useMemo(
+    () => (draft?.fields ?? []).filter((f) => !DEDICATED_WIDGET_KEYS.has(f.key)),
+    [draft?.fields],
   )
 
   return (
@@ -243,25 +257,40 @@ export function ConstructorView({ sessionId }: { sessionId: string | null }) {
 
         <section className="card">
           <div className="card-title">Ключевые поля</div>
-          {TEXT_FIELDS.map((field) => (
-            <div className="field" key={field.key}>
-              <label>{field.title}</label>
-              {field.rows ? (
-                <textarea
-                  rows={field.rows}
-                  placeholder={field.placeholder}
-                  value={state[field.key] ?? ''}
-                  onChange={(e) => update({ [field.key]: e.target.value })}
-                />
-              ) : (
-                <input
-                  placeholder={field.placeholder}
-                  value={state[field.key] ?? ''}
-                  onChange={(e) => update({ [field.key]: e.target.value })}
-                />
-              )}
-            </div>
-          ))}
+          {textFields.map((field) => {
+            const stateKey = STATE_KEY_OVERRIDES[field.key] ?? field.key
+            return (
+              <div className="field" key={field.key}>
+                <label>{field.title}{field.blocking && <span className="req"> *</span>}</label>
+                {TEXTAREA_FIELD_KEYS.has(field.key) ? (
+                  <textarea
+                    rows={2}
+                    placeholder={field.hint ?? ''}
+                    value={state[stateKey] ?? ''}
+                    onChange={(e) => update({ [stateKey]: e.target.value })}
+                  />
+                ) : (
+                  <input
+                    placeholder={field.hint ?? ''}
+                    value={state[stateKey] ?? ''}
+                    onChange={(e) => update({ [stateKey]: e.target.value })}
+                  />
+                )}
+              </div>
+            )
+          })}
+          {/* Безвесовое поле-катчол: не влияет на готовность ни у одного
+              шаблона (нет в required_fields), но раздел «Иные условия»
+              есть в канонической форме ТЗ, поэтому доступен всегда. */}
+          <div className="field">
+            <label>Иные условия</label>
+            <textarea
+              rows={2}
+              placeholder="Дополнительные требования"
+              value={state.other ?? ''}
+              onChange={(e) => update({ other: e.target.value })}
+            />
+          </div>
         </section>
 
         {draft && (

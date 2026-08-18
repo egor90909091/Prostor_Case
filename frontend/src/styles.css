@@ -361,6 +361,7 @@ main { flex: 1; padding: 20px 24px 60px; max-width: 1400px; width: 100%; margin:
 
 .field { margin: 10px 0; }
 .field label { display: block; font-size: 13px; color: var(--ink-2); margin-bottom: 4px; }
+.field label .req { color: var(--danger); }
 .field input, .field textarea, select {
   width: 100%; padding: 8px 11px; border: 1px solid var(--line);
   border-radius: 8px; background: var(--surface); resize: vertical;
