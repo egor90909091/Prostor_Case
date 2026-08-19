@@ -46,6 +46,8 @@ public record ExecutorHit(
 
 public record StageInfo(string Key, string Name, int UsedCount, int? MedianDays, string? Documentation);
 
+public record ProductRisk(string Title, string Severity, int Count);
+
 public record RelatedProduct(string ProductId, string Name, string Category, int Count, decimal Confidence);
 
 public record SimilarCalc(
@@ -373,6 +375,25 @@ public sealed class Db
             result.Add(new StageInfo(rd.GetString(0), rd.GetString(1), rd.GetInt32(2),
                 rd.IsDBNull(3) ? null : rd.GetInt32(3),
                 rd.IsDBNull(4) ? null : rd.GetString(4)));
+        return result;
+    }
+
+    // HAVING отсекает риски, встретившиеся в 1-2 ТЗ по услуге — на такой выборке
+    // это шум, а не типовой паттерн (тот же принцип, что calcs_cnt >= 10
+    // у productizationCandidates в GetAnalyticsJsonAsync).
+    public async Task<List<ProductRisk>> GetProductRisksAsync(string productId, int top, CancellationToken ct)
+    {
+        var result = new List<ProductRisk>();
+        await using var cmd = _source.CreateCommand(
+            "SELECT r->>'title' AS title, r->>'severity' AS severity, count(*)::int AS cnt " +
+            "FROM tz.document d, jsonb_array_elements(d.risks) r " +
+            "WHERE d.product_id = @p " +
+            "GROUP BY 1, 2 HAVING count(*) >= 3 ORDER BY cnt DESC LIMIT @t");
+        cmd.Parameters.AddWithValue("p", productId);
+        cmd.Parameters.AddWithValue("t", top);
+        await using var rd = await cmd.ExecuteReaderAsync(ct);
+        while (await rd.ReadAsync(ct))
+            result.Add(new ProductRisk(rd.GetString(0), rd.GetString(1), rd.GetInt32(2)));
         return result;
     }
 

@@ -77,9 +77,25 @@ export function AnalyticsView() {
   const max = (rows: { cnt?: number; works?: number; calcs_cnt?: number }[], key: string) =>
     Math.max(1, ...rows.map((r: any) => r[key] ?? 0))
 
+  const exportCsv = () => {
+    downloadCsv(buildAnalyticsCsv(data, documents, totalRequests, recognizedShare))
+  }
+
   return (
     <div className="analytics">
-      <h2>Аналитика</h2>
+      <div className="analytics-head">
+        <h2>Аналитика</h2>
+        <div className="analytics-actions">
+          <button className="btn small ghost" onClick={exportCsv}>
+            <DownloadIcon />
+            Скачать CSV
+          </button>
+          <button className="btn small ghost" onClick={() => window.print()}>
+            <PrintIcon />
+            Печать / PDF
+          </button>
+        </div>
+      </div>
 
       <div className="kpis">
         <Kpi label="Запросов за 30 дней" value={totalRequests} />
@@ -335,6 +351,95 @@ function TruncatedTick({ x, y, payload }: any) {
       {short}
     </text>
   )
+}
+
+function DownloadIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path d="M10 3v9.5M6.5 9l3.5 3.5L13.5 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M4 14.5V16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-1.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+function PrintIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path d="M6 7V3.5a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 .5.5V7" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+      <rect x="3.5" y="7" width="13" height="7" rx="1" stroke="currentColor" strokeWidth="1.5" />
+      <path d="M6 12.5h8v4a.5.5 0 0 1-.5.5h-7a.5.5 0 0 1-.5-.5v-4Z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+// Строим один CSV со всеми секциями сразу (а не отдельный файл на панель) —
+// пользователю аналитики обычно нужна выгрузка целиком для дальнейшей
+// обработки в Excel, а не блок за блоком.
+function csvCell(value: string | number | null | undefined): string {
+  const s = String(value ?? '')
+  return /[;"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+function csvSection(title: string, header: string[], rows: (string | number | null | undefined)[][]): string {
+  const lines = [title, header.map(csvCell).join(';')]
+  if (rows.length === 0) {
+    lines.push('нет данных')
+  } else {
+    rows.forEach((row) => lines.push(row.map(csvCell).join(';')))
+  }
+  return lines.join('\n')
+}
+
+function buildAnalyticsCsv(
+  data: Overview,
+  documents: any[],
+  totalRequests: number,
+  recognizedShare: number,
+): string {
+  const sections = [
+    csvSection('Сводка', ['Метрика', 'Значение'], [
+      ['Запросов за 30 дней', totalRequests],
+      ['Распознано, %', recognizedShare],
+      ['Создано ТЗ', data.tzCreated],
+      ['Средняя готовность, %', data.tzAvgReadiness],
+    ]),
+    csvSection('Запросы по дням', ['День', 'Распознано', 'Не распознано'],
+      data.requestsByDay.map((r) => [r.day, r.recognized, r.unrecognized])),
+    csvSection('Создание ТЗ по дням', ['День', 'Количество'],
+      data.tzByDay.map((r) => [r.day, r.cnt])),
+    csvSection('Самые востребованные услуги', ['Услуга', 'Запросов'],
+      data.topSearchedProducts.map((r) => [r.name, r.cnt])),
+    csvSection('Виды ТЗ', ['Шаблон', 'Количество'],
+      data.tzByTemplate.map((r) => [r.name, r.cnt])),
+    csvSection('Исполнители', ['Исполнитель', 'Работ', 'Услуг'],
+      data.topExecutors.map((r) => [r.name, r.works, r.products])),
+    csvSection('Сочетаемые услуги', ['Услуга', 'Сопутствующая услуга', 'Договоров'],
+      data.topPairs.map((r) => [r.product, r.related, r.cnt])),
+    csvSection('Типичные ошибки при формировании ТЗ', ['Риск', 'Критичность', 'Количество'],
+      data.topRisks.map((r) => [r.title, r.severity, r.cnt])),
+    csvSection('Часто добавляемые этапы', ['Этап', 'Количество'],
+      data.topStages.map((r) => [r.name, r.cnt])),
+    csvSection('Кандидаты на упаковку в типовой продукт', ['Услуга', 'Расчётов', 'Компаний', 'Типовой срок, дн'],
+      data.productizationCandidates.map((r) => [r.name, r.calcs_cnt, r.companies_cnt, r.typical_duration_days ?? ''])),
+    csvSection('Нераспознанные запросы', ['Запрос', 'Дата'],
+      data.unrecognizedQueries.map((r) => [r.query, r.created_at])),
+    csvSection('Последние созданные ТЗ', ['Услуга', 'Объект', 'Готовность, %', 'Рисков'],
+      documents.map((d) => [d.productName, d.objectName, d.readiness, d.risksCount])),
+  ]
+  return sections.join('\n\n')
+}
+
+function downloadCsv(content: string) {
+  const blob = new Blob(['﻿' + content], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  const date = new Date().toISOString().slice(0, 10)
+  a.href = url
+  a.download = `analytics_${date}.csv`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
 }
 
 function Bars({ rows, max }: { rows: { label: string; value: number }[]; max: number }) {

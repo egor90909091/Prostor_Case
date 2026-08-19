@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { renderAsync } from 'docx-preview'
-import { createTzDocument, draftTz, getStages, getTzDocument, getTemplates } from './api'
+import {
+  createTzDocument, draftTz, getProductRisks, getStages, getTzDocument, getTemplates, reviewDraft,
+} from './api'
+import type { ProductRisk, ReviewIssue } from './api'
 import { Readiness, severityLabel } from './Blocks'
+import { STATE_KEY_OVERRIDES, STATE_STORAGE_KEY, consumePendingFields } from './constructorStorage'
 
 interface Stage {
   key: string
@@ -52,11 +56,6 @@ interface DraftResponse {
 // обычный текстовый инпут, даже если шаблон включает их в required_fields.
 const DEDICATED_WIDGET_KEYS = new Set(['period', 'stages', 'operations', 'executors'])
 
-// Ключ поля в required_fields не всегда совпадает с именем свойства в
-// state (Drafting.cs на бэкенде читает часть полей по другому имени) —
-// единственное расхождение сегодня: source_data → sourceData.
-const STATE_KEY_OVERRIDES: Record<string, string> = { source_data: 'sourceData' }
-
 // Разделы, которые обычно требуют развёрнутого текста, а не одной строки
 const TEXTAREA_FIELD_KEYS = new Set([
   'purpose', 'perimeter', 'source_data', 'documentation', 'acceptance', 'other', 'kpi', 'conditions',
@@ -64,10 +63,11 @@ const TEXTAREA_FIELD_KEYS = new Set([
 
 // Конструктор не имеет бэкенд-сессии (как чат), поэтому состояние формы
 // хранится в localStorage: переключение вкладок и перезагрузка страницы
-// не теряют введённые данные. Ключ — const, значение — сериализованный
-// state. При редактировании существующего ТЗ (editTzId) сохранение
-// пропускается: state грузится из БД и не должен перетирать черновик.
-const STATE_STORAGE_KEY = 'prostor.constructor.state'
+// не теряют введённые данные. При редактировании существующего ТЗ
+// (editTzId) сохранение пропускается: state грузится из БД и не должен
+// перетирать черновик. STATE_KEY_OVERRIDES/STATE_STORAGE_KEY — в
+// constructorStorage.ts, тем же ключом ChatView патчит принятые в чате
+// LLM-подсказки (см. patchConstructorState).
 const INITIAL_STATE = { flags: {}, stages: [], executors: [], period: {} }
 
 export function ConstructorView({
@@ -92,6 +92,7 @@ export function ConstructorView({
   })
   const [templates, setTemplates] = useState<{ id: string; name: string }[]>([])
   const [availableStages, setAvailableStages] = useState<Stage[]>([])
+  const [productRisks, setProductRisks] = useState<ProductRisk[]>([])
   const [draft, setDraft] = useState<DraftResponse | null>(null)
   const [result, setResult] = useState<{
     tzId: string
@@ -102,6 +103,12 @@ export function ConstructorView({
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [savingDraft, setSavingDraft] = useState(false)
+  // Замечания ИИ-ревьюера — снимок на момент клика, не пересчитывается
+  // автоматически при правках формы (как это делает draft.risks): это
+  // явное, осознанное действие пользователя, а не фоновая проверка.
+  const [aiIssues, setAiIssues] = useState<ReviewIssue[] | null>(null)
+  const [aiAvailable, setAiAvailable] = useState(true)
+  const [aiChecking, setAiChecking] = useState(false)
   // Рендер готового .docx в браузере: после сохранения тащим бинарь по
   // downloadUrl и просим docx-preview отрисовать WordprocessingML в DOM.
   // Позволяет пользователю увидеть финальный документ, не уходя в «Мои
@@ -131,13 +138,35 @@ export function ConstructorView({
   // Шаблоны нужны всегда — без них конструктор не знает, какой набор
   // полей рисовать.
   useEffect(() => {
+    // React.StrictMode в деве нарочно вызывает этот эффект дважды подряд
+    // (mount → cleanup → mount) — обе асинхронные ветки ниже без этого
+    // флага независимо резолвились бы и каждая писала бы setState поверх
+    // другой. Раньше это было безвредно (обе загружали одни и те же
+    // данные), но applyPending() ниже — деструктивное чтение очереди:
+    // при гонке первая резолвнувшаяся ветка забирала все накопленные
+    // поля, а setState второй ветки (без applyPending — очередь уже
+    // пуста) стирал их обратно. cancelled гарантирует, что применяется
+    // только результат актуального (последнего) запуска эффекта.
+    let cancelled = false
+
     getTemplates()
       .then((r) => setTemplates(r.items ?? []))
       .catch(() => setError('Сервис ТЗ недоступен'))
 
+    // Поля, принятые как LLM-подсказки в чате, накапливаются в отдельной
+    // очереди (не в STATE_STORAGE_KEY напрямую — иначе преждевременно
+    // взвели бы hasStored ниже и обрезали загрузку из чата при первом
+    // открытии). Подмешиваем их поверх того состояния, которое реально
+    // загрузится — независимо от того, какая из трёх веток сработает.
+    const applyPending = () => {
+      const pending = consumePendingFields()
+      if (Object.keys(pending).length > 0) setState((prev: any) => ({ ...prev, ...pending }))
+    }
+
     if (editTzId) {
       getTzDocument(editTzId)
         .then((doc) => {
+          if (cancelled) return
           // payload хранит исходный state плюс служебные поля (sections,
           // readiness) — служебные убираем, они пересчитаются на draft.
           const payload = doc.payload ?? {}
@@ -157,9 +186,10 @@ export function ConstructorView({
               .then((r) => setAvailableStages(r.items ?? []))
               .catch(() => undefined)
           }
+          applyPending()
         })
         .catch(() => setError('Не удалось загрузить ТЗ'))
-      return
+      return () => { cancelled = true }
     }
 
     // Если в localStorage уже есть сохранённое состояние — не грузим
@@ -167,16 +197,26 @@ export function ConstructorView({
     // данных диалога. Чат-данные грузятся только при первом открытии
     // конструктора (когда localStorage пуст).
     const hasStored = !!localStorage.getItem(STATE_STORAGE_KEY)
-    if (!sessionId || hasStored) return
+    if (!sessionId || hasStored) {
+      applyPending()
+      return () => { cancelled = true }
+    }
 
     fetch(`/api/v1/chat/sessions/${sessionId}/state`)
       .then((r) => (r.ok ? r.json() : null))
       .then((s) => {
-        if (!s) return
+        if (cancelled) return
+        if (!s) {
+          applyPending()
+          return
+        }
         setState({ ...INITIAL_STATE, ...s })
         if (s.productId) getStages(s.productId).then((r) => setAvailableStages(r.items ?? []))
+        applyPending()
       })
-      .catch(() => undefined)
+      .catch(() => { if (!cancelled) applyPending() })
+
+    return () => { cancelled = true }
   }, [sessionId, editTzId])
 
   // Сохраняем состояние формы в localStorage на каждое изменение.
@@ -201,6 +241,19 @@ export function ConstructorView({
       .then((r) => setAvailableStages(r.items ?? []))
       .catch(() => undefined)
   }, [state.productId, editTzId, availableStages.length])
+
+  // Типичные риски по услуге — независимо от editTzId/sessionId, запрос
+  // дешёвый и идемпотентный, отдельного гейта на «уже загружено» не нужно.
+  useEffect(() => {
+    const productId = state.productId
+    if (!productId) {
+      setProductRisks([])
+      return
+    }
+    getProductRisks(productId)
+      .then((r) => setProductRisks(r.items ?? []))
+      .catch(() => setProductRisks([]))
+  }, [state.productId])
 
   // Рендер готового .docx в браузере после сохранения. Та же связка
   // docx-preview, что и на странице «Мои заявки»: бинарь приходит по
@@ -315,6 +368,35 @@ export function ConstructorView({
     setCustomStageDocs('')
   }
 
+  // Явная кнопка, а не автозаполнение при загрузке typicalDays — чтобы не
+  // затирать частично введённые пользователем даты без его ведома.
+  const applyTypicalPeriod = () => {
+    if (!draft?.typicalDays) return
+    const from = new Date()
+    const to = new Date(from)
+    to.setDate(to.getDate() + draft.typicalDays - 1)
+    const fmt = (d: Date) => d.toISOString().slice(0, 10)
+    update({ period: { from: fmt(from), to: fmt(to) } })
+  }
+
+  // Массово отмечает типовые этапы (тот же порог usedCount > 1, что и в
+  // чате у StageListBlock). Показывается только пока пользователь ещё
+  // ничего не выбрал вручную — не затирает уже сделанный выбор.
+  const applyTypicalStages = () => {
+    const typical = availableStages.filter((s) => (s.usedCount ?? 0) > 1)
+    if (typical.length === 0) return
+    setResult(null)
+    setState((prev: any) => ({
+      ...prev,
+      stages: typical.map((s) => ({
+        key: s.key,
+        name: s.name,
+        days: s.medianDays ?? null,
+        documentation: s.documentation ?? null,
+      })),
+    }))
+  }
+
   const removeStage = (key: string) => {
     setResult(null)
     setState((prev: any) => ({
@@ -374,6 +456,14 @@ export function ConstructorView({
   const generate = () => save(false)
   const saveDraft = () => save(true)
 
+  const checkWithAi = async () => {
+    setAiChecking(true)
+    const res = await reviewDraft(templateId, state)
+    setAiIssues(res.issues)
+    setAiAvailable(res.available)
+    setAiChecking(false)
+  }
+
   const chosenKeys = useMemo(
     () => new Set((state.stages ?? []).map((s: any) => s.key)),
     [state.stages],
@@ -417,6 +507,24 @@ export function ConstructorView({
           {state.productName && <div className="card-sub">Услуга из диалога: {state.productName}</div>}
         </section>
 
+        {state.productId && productRisks.length > 0 && (
+          <section className="card">
+            <div className="card-title">История по услуге</div>
+            <div className="card-sub">Риски, которые чаще всего встречаются в ТЗ на эту услугу</div>
+            <ul className="risks">
+              {productRisks.map((r) => (
+                <li className={`risk ${r.severity}`} key={r.title}>
+                  <span className="sev">{severityLabel(r.severity)}</span>
+                  <div>
+                    <strong>{r.title}</strong>
+                    <div className="muted">Встречался в {r.count} ТЗ по этой услуге</div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
         <section className="card">
           <div className="card-title">Сроки выполнения</div>
           <div className="row">
@@ -438,6 +546,11 @@ export function ConstructorView({
             </label>
             {draft?.typicalDays ? (
               <span className="muted">типовой срок: {draft.typicalDays} дн.</span>
+            ) : null}
+            {draft?.typicalDays ? (
+              <button type="button" className="btn ghost small" onClick={applyTypicalPeriod}>
+                Заполнить по типовому сроку
+              </button>
             ) : null}
           </div>
         </section>
@@ -471,6 +584,11 @@ export function ConstructorView({
           {availableStages.length > 0 ? (
             <>
               <div className="card-sub">Структура собрана из реальных расчётов по выбранной услуге</div>
+              {(state.stages ?? []).length === 0 && (
+                <button type="button" className="btn ghost small" onClick={applyTypicalStages}>
+                  Отметить типовые этапы
+                </button>
+              )}
               <ul className="checklist">
                 {availableStages.map((stage) => (
                   <li key={stage.key}>
@@ -661,6 +779,37 @@ export function ConstructorView({
             </li>
           ))}
         </ul>
+
+        <h4>Замечания ИИ</h4>
+        <button
+          type="button"
+          className="btn ghost small"
+          disabled={aiChecking}
+          onClick={() => void checkWithAi()}
+        >
+          {aiChecking ? 'Проверяю…' : 'Проверить ИИ'}
+        </button>
+        {aiIssues !== null && (
+          aiAvailable ? (
+            aiIssues.length === 0 ? (
+              <p className="muted small">Замечаний не найдено</p>
+            ) : (
+              <ul className="risks">
+                {aiIssues.map((issue, i) => (
+                  <li className={`risk ${issue.severity}`} key={i}>
+                    <span className="sev">{severityLabel(issue.severity)}</span>
+                    <div>
+                      <strong>{issue.title}</strong>
+                      <div className="muted">{issue.detail}</div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )
+          ) : (
+            <p className="muted small">ИИ-проверка временно недоступна</p>
+          )
+        )}
 
         <button
           className="btn primary wide"

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createSession, getSession, sendTurn } from './api'
 import type { Block, ChatStateSnapshot, TurnAction } from './api'
 import { BlockView } from './Blocks'
+import { queueSuggestedField } from './constructorStorage'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -49,6 +50,12 @@ export function ChatView({
   const [error, setError] = useState<string | null>(null)
   const [confirmingReset, setConfirmingReset] = useState(false)
   const bottom = useRef<HTMLDivElement>(null)
+  // Автопрокрутка «прилипает» к низу, только пока пользователь сам находится
+  // у последнего сообщения. Если он прокрутил вверх — читать историю, —
+  // стрим больше не должен выдёргивать экран вниз при каждой новой реплике.
+  const pinnedToBottom = useRef(true)
+  const skipNextScroll = useRef(true)
+  const scrollTimer = useRef<number | null>(null)
 
   function startNewSession() {
     return createSession('Демо-заказчик')
@@ -56,6 +63,8 @@ export function ChatView({
         localStorage.setItem(SESSION_STORAGE_KEY, s.sessionId)
         setSessionId(s.sessionId)
         setState(s.state)
+        pinnedToBottom.current = true
+        skipNextScroll.current = true
         setMessages([WELCOME_MESSAGE])
       })
       .catch(() => setError('Бэкенд недоступен. Проверьте, что сервисы запущены.'))
@@ -75,6 +84,8 @@ export function ChatView({
       .then((detail) => {
         setSessionId(detail.sessionId)
         setState(detail.state)
+        pinnedToBottom.current = true
+        skipNextScroll.current = true
         setMessages(
           detail.messages.length > 0
             ? detail.messages.map((m) => ({ role: m.role, blocks: m.blocks }))
@@ -91,14 +102,55 @@ export function ChatView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Отслеживаем, видит ли пользователь последнее сообщение: сравнивать
+  // scrollTop с высотой всей страницы нельзя — под лентой ещё есть композер
+  // и примеры, так что «низ страницы» и «низ переписки» — разные точки.
+  // Вместо этого на каждый scroll меряем положение сторожевого div через
+  // getBoundingClientRect — синхронно и без зависимости от отдельного
+  // цикла анимации/пересечений.
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: 'smooth' })
+    const updatePinned = () => {
+      const el = bottom.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      pinnedToBottom.current = rect.top <= window.innerHeight + 120
+    }
+    updatePinned()
+    window.addEventListener('scroll', updatePinned, { passive: true })
+    window.addEventListener('resize', updatePinned)
+    return () => {
+      window.removeEventListener('scroll', updatePinned)
+      window.removeEventListener('resize', updatePinned)
+    }
+  }, [])
+
+  // Прокрутка к низу батчится через таймер, чтобы частые дельты стрима не
+  // запускали смуз-анимацию заново на каждый чанк — иначе экран дёргается
+  // вместо плавного «догоняющего» скролла. requestAnimationFrame здесь не
+  // подходит: он замирает на фоновой/неактивной вкладке, а стрим должен
+  // продолжать плавно доезжать до низа и в таком состоянии. При
+  // восстановлении истории первый проход — мгновенный прыжок, а не проезд
+  // через весь диалог.
+  useEffect(() => {
+    if (messages.length === 0 || !pinnedToBottom.current) return
+    const behavior = skipNextScroll.current ? 'auto' : 'smooth'
+    skipNextScroll.current = false
+    if (scrollTimer.current !== null) window.clearTimeout(scrollTimer.current)
+    scrollTimer.current = window.setTimeout(() => {
+      bottom.current?.scrollIntoView({ behavior, block: 'end' })
+    }, 0)
+    return () => {
+      if (scrollTimer.current !== null) window.clearTimeout(scrollTimer.current)
+    }
   }, [messages])
 
   async function run(body: { text?: string; action?: TurnAction }, userLabel: string) {
     if (!sessionId || busy) return
     setBusy(true)
     setError(null)
+    // Своя реплика — явное действие, ради которого стоит вернуться к низу,
+    // даже если до этого пользователь листал историю вверх.
+    pinnedToBottom.current = true
     setMessages((prev) => [...prev, { role: 'user', blocks: [{ type: 'text', text: userLabel }] }])
 
     let assistant: Message = { role: 'assistant', blocks: [] }
@@ -186,7 +238,15 @@ export function ChatView({
                     key={i}
                     block={block}
                     disabled={busy}
-                    onAction={(action) => void run({ action }, actionLabel(action))}
+                    onAction={(action) => {
+                      // В очередь, а не сразу в основной state конструктора:
+                      // прямая запись до первого открытия вкладки взвела бы
+                      // guard hasStored и обрезала бы загрузку услуги/этапов
+                      // из чата при первом визите (см. constructorStorage.ts).
+                      if (action.type === 'set_field' && action.key && action.value !== undefined)
+                        queueSuggestedField(action.key, action.value)
+                      void run({ action }, actionLabel(action))
+                    }}
                     onOpenConstructor={() => sessionId && onOpenConstructor(sessionId)}
                   />
                 ))}
@@ -311,6 +371,10 @@ function actionLabel(action: TurnAction): string {
       return `Операции: ${action.ids?.length}`
     case 'set_flag':
       return action.flag ? 'Добавляю условие работ' : 'Снимаю условие работ'
+    case 'set_field':
+      return 'Принимаю предложенное поле'
+    case 'suggest_fields':
+      return 'Прошу предложить поля по описанию'
     default:
       return action.type
   }

@@ -447,6 +447,10 @@ app.MapGet("/api/v1/catalog/products/{productId}/operations", async (
     string productId, Db db, CancellationToken ct) =>
     Results.Ok(new { items = await db.GetOperationsAsync(productId, ct) }));
 
+app.MapGet("/api/v1/catalog/products/{productId}/risks", async (
+    string productId, int? top, Db db, CancellationToken ct) =>
+    Results.Ok(new { items = await db.GetProductRisksAsync(productId, top ?? 5, ct) }));
+
 app.MapGet("/api/v1/catalog/products/{productId}/related", async (
     string productId, Db db, CancellationToken ct) =>
     Results.Ok(new { items = await db.GetRelatedAsync(productId, 6, ct) }));
@@ -495,6 +499,103 @@ app.MapPost("/api/v1/executors/search", async (
 app.MapGet("/api/v1/analytics/overview", async (Db db, CancellationToken ct) =>
     Results.Content(await db.GetAnalyticsJsonAsync(ct), "application/json"));
 
+// ------------------------------------------------------------------ ревью
+// НЕ /api/v1/tz/... — nginx/vite проксируют этот префикс на Prostor.Tz
+// строковым совпадением (см. frontend/nginx.conf), а ILlm есть только
+// здесь, в Prostor.Chat. Ревью самодостаточно (templateId+state), сессия
+// чата не нужна — конструктор может открыть и уже сохранённое ТЗ без sessionId.
+static string? StrValue(JsonNode? node) =>
+    node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+
+// Набор полей фиксирован везде в системе (ApplyField/TEXTAREA_FIELD_KEYS на
+// фронте, Drafting.IsFilled на бэкенде) — семантику можно захардкодить прямо
+// в промпте, без похода в Prostor.Tz за шаблоном (сервисы общаются только по
+// HTTP через TzClient, а не через общие таблицы БД).
+const string ReviewSystemPrompt = """
+Ты — эксперт по составлению технических заданий (ТЗ) на инжиниринговые и
+консалтинговые услуги в нефтегазовой отрасли. Тебе дают черновик ключевых
+полей ТЗ. Поля:
+- Заказчик
+- Объект работ (месторождение, скважина, участок)
+- Цель работ
+- Периметр работ (границы, что включено/не включено)
+- Исходные данные, которые предоставляет заказчик
+- Итоговая документация, которую должен сдать исполнитель
+- Критерии приёмки результата
+- Прочие условия
+
+Найди: явные противоречия между полями; расплывчатые формулировки без
+конкретики («в кратчайшие сроки» без даты, «стандартные требования» без
+описания, «по необходимости»); несостыковки между целью и объектом работ.
+Не считай проблемой само по себе пустое поле — пустые поля уже подсвечены
+отдельно, это не твоя зона ответственности.
+
+Ответь СТРОГО одним JSON-объектом вида:
+{"issues": [{"title": "краткая суть", "detail": "что именно и почему это
+проблема", "severity": "warning"}]}
+severity — всегда "warning" или "info", никогда ничего другого.
+Если проблем не нашёл — {"issues": []}.
+""";
+
+static string BuildReviewUserPrompt(JsonObject state)
+{
+    string? Get(string key) => StrValue(state[key]);
+    var sb = new StringBuilder();
+    sb.AppendLine("Черновик ТЗ:");
+    void Field(string label, string? value) =>
+        sb.AppendLine($"{label}: {(string.IsNullOrWhiteSpace(value) ? "(не заполнено)" : value)}");
+    Field("Заказчик", Get("customer"));
+    Field("Объект работ", Get("object"));
+    Field("Цель работ", Get("purpose"));
+    Field("Периметр работ", Get("perimeter"));
+    Field("Исходные данные", Get("sourceData"));
+    Field("Итоговая документация", Get("documentation"));
+    Field("Критерии приёмки", Get("acceptance"));
+    Field("Прочие условия", Get("other"));
+    return sb.ToString();
+}
+
+app.MapPost("/api/v1/review/draft", async (
+    ReviewDraftRequest body, ILlm llm, AppConfig cfg, ILoggerFactory loggerFactory, CancellationToken ct) =>
+{
+    var log = loggerFactory.CreateLogger("review");
+    var state = body.State ?? new JsonObject();
+
+    JsonObject? result;
+    try
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(TimeSpan.FromSeconds(cfg.LlmTimeoutSeconds));
+        result = await llm.CompleteJsonAsync(ReviewSystemPrompt, BuildReviewUserPrompt(state), cts.Token);
+    }
+    catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+    {
+        log.LogWarning(ex, "ИИ-ревью черновика недоступно");
+        return Results.Ok(new { issues = Array.Empty<object>(), available = false });
+    }
+
+    if (result is null)
+        return Results.Ok(new { issues = Array.Empty<object>(), available = false });
+
+    // severity из этого канала никогда не может быть "blocking" — за то,
+    // что блокирует canGenerate, отвечает только rule-based движок в
+    // Prostor.Tz (Drafting.cs), сюда ничего не подмешивается.
+    var allowedSeverity = new HashSet<string>(StringComparer.Ordinal) { "warning", "info" };
+    var issues = (result["issues"] as JsonArray ?? new JsonArray())
+        .OfType<JsonObject>()
+        .Select(i => new
+        {
+            title = StrValue(i["title"]) ?? "",
+            detail = StrValue(i["detail"]) ?? "",
+            severity = StrValue(i["severity"]) ?? "info"
+        })
+        .Where(i => !string.IsNullOrWhiteSpace(i.title) && allowedSeverity.Contains(i.severity))
+        .Take(8)
+        .ToList();
+
+    return Results.Ok(new { issues, available = true });
+});
+
 app.Run();
 
 // ---------------------------------------------------------------- вспомогательное
@@ -502,6 +603,7 @@ public sealed record CreateSessionRequest(string? CustomerName);
 public sealed record SearchRequest(string? Query, int? TopK);
 public sealed record ExecutorSearchRequest(
     string ProductId, string? From, string? To, bool? AllowSubcontract, int? Top);
+public sealed record ReviewDraftRequest(string? TemplateId, JsonObject? State);
 
 /// <summary>Общий приёмник событий хода — общий код в Program.cs пишет в него,
 /// не зная, летит ли событие клиенту по SSE или по WebSocket.</summary>

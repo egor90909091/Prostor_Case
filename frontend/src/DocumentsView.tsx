@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { renderAsync } from 'docx-preview'
 import { getTzDocumentVersions, listTzDocuments, type TzVersionItem } from './api'
-import { DocxIcon } from './Blocks'
+import { DocxIcon, readinessTone } from './Blocks'
 
 interface DocRow {
   tzId: string
@@ -24,6 +24,24 @@ function fmtDate(iso: string): string {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+// Пока продукт не выбран в диалоге, api отдаёт productName как «—» —
+// в списке это выглядит как ошибка, поэтому подменяем на имя шаблона.
+function docTitle(doc: DocRow): string {
+  if (doc.productName && doc.productName !== '—') return doc.productName
+  return doc.templateName || 'Без названия'
+}
+
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 40 40" fill="none" aria-hidden="true">
+      <path
+        d="M6 12a2 2 0 0 1 2-2h7l3 3h14a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V12Z"
+        stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round"
+      />
+    </svg>
+  )
 }
 
 export function DocumentsView({ onOpenInConstructor }: { onOpenInConstructor: (tzId: string) => void }) {
@@ -105,35 +123,52 @@ export function DocumentsView({ onOpenInConstructor }: { onOpenInConstructor: (t
 
       <div className="documents-layout">
         <section className="card documents-list">
-          <div className="card-title">Созданные ТЗ</div>
+          <div className="card-title">
+            Созданные ТЗ
+            {documents.length > 0 && <span className="count">{documents.length}</span>}
+          </div>
           {documents.length === 0 ? (
-            <p className="muted">ТЗ пока не создавались</p>
+            <div className="documents-list-empty">
+              <FolderIcon />
+              <strong>ТЗ пока не создавались</strong>
+              <p className="muted small">Соберите техническое задание в чате или конструкторе — оно появится здесь</p>
+            </div>
           ) : (
             <ul className="plain">
-              {documents.map((doc) => (
-                <li
-                  key={doc.tzId}
-                  className={`doc-row${selectedId === doc.tzId ? ' on' : ''}`}
-                  onClick={() => {
-                    setSelectedId(doc.tzId)
-                    setShowVersions(false)
-                  }}
-                >
-                  <div className="doc-row-head">
-                    <strong>{doc.productName}</strong>
-                    <span className="muted small">{fmtDate(doc.createdAt)}</span>
-                  </div>
-                  <div className="muted small">
-                    {doc.templateName}
-                    {doc.objectName && doc.objectName !== '—' ? ` · ${doc.objectName}` : ''}
-                  </div>
-                  <div className="doc-row-meta">
-                    {doc.status === 'draft' && <span className="badge draft">Черновик</span>}
-                    <span className="badge readiness">Готовность {doc.readiness}%</span>
-                    <span className="badge">Рисков: {doc.risksCount}</span>
-                  </div>
-                </li>
-              ))}
+              {documents.map((doc) => {
+                const tone = readinessTone(doc.readiness)
+                return (
+                  <li
+                    key={doc.tzId}
+                    className={`doc-row${selectedId === doc.tzId ? ' on' : ''}`}
+                    onClick={() => {
+                      setSelectedId(doc.tzId)
+                      setShowVersions(false)
+                    }}
+                  >
+                    <div className="doc-row-icon"><DocxIcon /></div>
+                    <div className="doc-row-body">
+                      <div className="doc-row-head">
+                        <strong>{docTitle(doc)}</strong>
+                        <span className="muted small">{fmtDate(doc.createdAt)}</span>
+                      </div>
+                      <div className="muted small doc-row-sub">
+                        {doc.templateName}
+                        {doc.objectName && doc.objectName !== '—' ? ` · ${doc.objectName}` : ''}
+                      </div>
+                      <div className="doc-row-meta">
+                        <span className={`badge ${doc.status === 'draft' ? 'draft' : 'ok'}`}>
+                          {doc.status === 'draft' ? 'Черновик' : 'Готово'}
+                        </span>
+                        <span className={`badge ${tone}`}>Готовность {doc.readiness}%</span>
+                        <span className="badge neutral">
+                          {doc.risksCount > 0 ? `Рисков: ${doc.risksCount}` : 'Рисков нет'}
+                        </span>
+                      </div>
+                    </div>
+                  </li>
+                )
+              })}
             </ul>
           )}
         </section>
@@ -141,7 +176,9 @@ export function DocumentsView({ onOpenInConstructor }: { onOpenInConstructor: (t
         <section className="card documents-preview">
           {!selectedId && (
             <div className="documents-empty">
-              <p className="muted">Выберите ТЗ слева, чтобы просмотреть документ</p>
+              <DocxIcon />
+              <strong>Выберите ТЗ слева</strong>
+              <p className="muted small">Документ откроется прямо здесь — со всеми полями и оформлением</p>
             </div>
           )}
 
@@ -190,7 +227,7 @@ export function DocumentsView({ onOpenInConstructor }: { onOpenInConstructor: (t
                           <span className="version-num">v{v.version}</span>
                           <span className="muted small">{fmtDate(v.createdAt)}</span>
                           {v.status === 'draft' && <span className="badge draft">Черновик</span>}
-                          <span className="badge">Готовность {v.readiness}%</span>
+                          <span className={`badge ${readinessTone(v.readiness)}`}>Готовность {v.readiness}%</span>
                           <a
                             className="btn small ghost"
                             href={v.downloadUrl}

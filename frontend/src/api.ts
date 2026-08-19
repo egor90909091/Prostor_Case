@@ -222,9 +222,42 @@ export async function getTemplates() {
   return response.json()
 }
 
+export interface ReviewIssue {
+  title: string
+  detail: string
+  severity: string
+}
+
+// НЕ /api/v1/tz/... — этот путь физически живёт в Prostor.Chat (там есть
+// LLM), а nginx/vite проксируют префикс /api/v1/tz строковым совпадением
+// на Prostor.Tz (см. frontend/nginx.conf).
+export async function reviewDraft(
+  templateId: string,
+  state: any,
+): Promise<{ issues: ReviewIssue[]; available: boolean }> {
+  const response = await fetch('/api/v1/review/draft', {
+    method: 'POST',
+    headers: json,
+    body: JSON.stringify({ templateId, state }),
+  })
+  if (!response.ok) return { issues: [], available: false }
+  return response.json()
+}
+
 // ------------------------------------------------------------ справочники
 export async function getStages(productId: string) {
   const response = await fetch(`/api/v1/catalog/products/${productId}/stages?top=20`)
+  return response.json()
+}
+
+export interface ProductRisk {
+  title: string
+  severity: string
+  count: number
+}
+
+export async function getProductRisks(productId: string): Promise<{ items: ProductRisk[] }> {
+  const response = await fetch(`/api/v1/catalog/products/${productId}/risks?top=5`)
   return response.json()
 }
 

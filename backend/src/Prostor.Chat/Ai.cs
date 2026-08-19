@@ -250,6 +250,18 @@ public interface ILlm
     /// </summary>
     Task<LlmDecision> DecideAsync(string system, string user, CancellationToken ct);
 
+    /// <summary>
+    /// Один нестримящийся вызов в JSON-mode: структурированное извлечение
+    /// (подсказки для полей черновика) или ревью текста. Как и DecideAsync/
+    /// StreamAsync, ошибки (сеть, не-2xx, невалидный JSON в ответе) не
+    /// перехватываются здесь — это дело вызывающей стороны (таймаут через
+    /// linked CTS + try/catch, тем же паттерном, что уже применяется вокруг
+    /// DecideAsync в TryRouteAsync). Возвращает null, только если модель
+    /// ответила пустым содержимым, — не значит «недоступен», это решает
+    /// вызывающая сторона по перехваченному исключению.
+    /// </summary>
+    Task<JsonObject?> CompleteJsonAsync(string system, string user, CancellationToken ct);
+
     string Kind { get; }
 }
 
@@ -295,6 +307,10 @@ public sealed class StubLlm : ILlm
     /// </summary>
     public Task<LlmDecision> DecideAsync(string system, string user, CancellationToken ct) =>
         Task.FromResult(new LlmDecision(ReplyText: null, ToolName: RouterTool.SearchServices));
+
+    /// <summary>Пустой, но не null объект: «отработал, предложить нечего» — не путать с недоступностью.</summary>
+    public Task<JsonObject?> CompleteJsonAsync(string system, string user, CancellationToken ct) =>
+        Task.FromResult<JsonObject?>(new JsonObject());
 }
 
 public sealed class OpenAiLlm : ILlm
@@ -394,6 +410,41 @@ public sealed class OpenAiLlm : ILlm
 
         var text = message.TryGetProperty("content", out var content) ? content.GetString() : null;
         return new LlmDecision(text, null);
+    }
+
+    /// <summary>
+    /// Тот же нестримящийся round-trip, что и DecideAsync, но с response_format
+    /// json_object вместо tools — используется для извлечения полей черновика и
+    /// ревью текста, где нужен структурированный, а не диалоговый ответ.
+    /// </summary>
+    public async Task<JsonObject?> CompleteJsonAsync(string system, string user, CancellationToken ct)
+    {
+        var payload = new
+        {
+            model = _config.LlmModel,
+            stream = false,
+            temperature = 0.1,
+            messages = new object[]
+            {
+                new { role = "system", content = system },
+                new { role = "user", content = user }
+            },
+            response_format = new { type = "json_object" }
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "chat/completions")
+        {
+            Content = JsonContent.Create(payload)
+        };
+        using var response = await _http.SendAsync(request, ct);
+        response.EnsureSuccessStatusCode();
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+        var choices = doc.RootElement.GetProperty("choices");
+        if (choices.GetArrayLength() == 0) return null;
+        var content = choices[0].GetProperty("message").GetProperty("content").GetString();
+        if (string.IsNullOrWhiteSpace(content)) return null;
+        return JsonNode.Parse(content) as JsonObject;
     }
 
     public async IAsyncEnumerable<string> StreamAsync(

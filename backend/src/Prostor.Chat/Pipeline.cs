@@ -403,6 +403,10 @@ public sealed class TurnPipeline
                 await AppendDraftAsync(sessionId, state, blocks, ct);
                 break;
 
+            case "suggest_fields":
+                await SuggestFieldsAsync(state, blocks, ct);
+                break;
+
             case "set_flag":
                 state.Flags[action.Key ?? ""] = action.Flag ?? true;
                 blocks.Add(Block.TextBlock(
@@ -476,6 +480,24 @@ public sealed class TurnPipeline
         if (similar.Count > 0) blocks.Add(SimilarCalcsBlock(similar));
         if (related.Count > 0) blocks.Add(RelatedBlock(related));
         blocks.Add(RecommendationsBlock(state, stages, operations));
+
+        // Явная кнопка, а не тихий вызов LLM здесь же: SelectProductAsync не
+        // получает emit (блоки флашатся только после возврата из
+        // HandleActionAsync), поэтому синхронный вызов CompleteJsonAsync
+        // держал бы период-карточку в подвешенном состоянии до 45 секунд
+        // при недоступности LLM. suggest_fields — отдельное действие со
+        // своим ходом и таймаутом.
+        if (!string.IsNullOrWhiteSpace(state.LastQuery))
+        {
+            blocks.Add(new Block
+            {
+                Type = "actions",
+                Items = new JsonArray
+                {
+                    new JsonObject { ["action"] = "suggest_fields", ["title"] = "Предложить поля ТЗ по описанию" }
+                }
+            });
+        }
     }
 
     private async Task SetPeriodAsync(
@@ -602,6 +624,90 @@ public sealed class TurnPipeline
             case "acceptance": state.Acceptance = value; break;
             case "other": state.Other = value; break;
         }
+    }
+
+    // Ключи те же, что и у set_field/ApplyField (кроме customer/object/other —
+    // их не извлекаем: объект работ уже покрыт TryFillFreeField, заказчик и
+    // «прочее» слишком открытые, чтобы LLM не начала додумывать).
+    private const string SuggestFieldsSystemPrompt = """
+        Ты помогаешь извлечь структурированные данные из описания потребности
+        заказчика нефтесервисных услуг. Из текста пользователя извлеки, только
+        если это явно следует из него (не додумывай и не обобщай сверх сказанного):
+        - purpose — цель работ
+        - perimeter — периметр/границы работ
+        - source_data — исходные данные, которые уже есть у заказчика
+        - documentation — какая итоговая документация нужна на выходе
+        - acceptance — критерии приёмки результата
+
+        Если что-то из этого текст не содержит — не включай такой ключ в ответ
+        вообще (не выдумывай общие фразы вместо этого).
+
+        Ответь СТРОГО одним JSON-объектом с этими ключами (только теми, что
+        нашёл), значения — короткие фразы на русском языке, без вступлений.
+        """;
+
+    private static readonly Dictionary<string, string> SuggestableFieldLabels = new()
+    {
+        ["purpose"] = "Цель работ",
+        ["perimeter"] = "Периметр работ",
+        ["source_data"] = "Исходные данные",
+        ["documentation"] = "Итоговая документация",
+        ["acceptance"] = "Критерии приёмки",
+    };
+
+    /// <summary>
+    /// Извлечение черновика текстовых полей ТЗ из последнего свободного
+    /// описания потребности (state.LastQuery). Явное действие пользователя —
+    /// не срабатывает молча при выборе услуги (см. комментарий в
+    /// SelectProductAsync). Ничего не применяется в ChatState автоматически:
+    /// каждое поле пользователь принимает отдельно через обычный set_field,
+    /// уже на фронте (Blocks.tsx, SuggestedFields).
+    /// </summary>
+    private async Task SuggestFieldsAsync(ChatState state, List<Block> blocks, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(state.LastQuery))
+        {
+            blocks.Add(Block.TextBlock("Пока нечего предложить — опишите потребность текстом."));
+            return;
+        }
+
+        JsonObject? result;
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(TimeSpan.FromSeconds(_config.LlmTimeoutSeconds));
+            result = await _llm.CompleteJsonAsync(SuggestFieldsSystemPrompt, state.LastQuery, cts.Token);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            _log.LogWarning(ex, "извлечение полей ТЗ недоступно");
+            blocks.Add(Block.TextBlock("Не удалось предложить поля — заполните их вручную в конструкторе."));
+            return;
+        }
+
+        var items = new JsonArray();
+        if (result is not null)
+        {
+            foreach (var (key, label) in SuggestableFieldLabels)
+            {
+                var value = result[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s.Trim() : null;
+                if (string.IsNullOrWhiteSpace(value)) continue;
+                items.Add(new JsonObject { ["key"] = key, ["label"] = label, ["value"] = value });
+            }
+        }
+
+        if (items.Count == 0)
+        {
+            blocks.Add(Block.TextBlock("По описанию не нашёл, чем заполнить поля автоматически — впишите вручную."));
+            return;
+        }
+
+        blocks.Add(new Block
+        {
+            Type = "suggested_fields",
+            Text = "Кажется, вот что можно заполнить по вашему описанию — проверьте и примените",
+            Items = items
+        });
     }
 
     private static string FlagTitle(string? key) => key switch

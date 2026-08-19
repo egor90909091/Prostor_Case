@@ -40,12 +40,21 @@ export function BlockView({ block, disabled, onAction, onOpenConstructor }: Prop
       return (
         <div className="actions">
           {(block.items ?? []).map((item, i) => (
-            <button key={i} className="btn primary" disabled={disabled} onClick={onOpenConstructor}>
+            <button
+              key={i}
+              className="btn primary"
+              disabled={disabled}
+              onClick={() =>
+                item.action === 'open_constructor' ? onOpenConstructor() : onAction({ type: item.action })
+              }
+            >
               {item.title}
             </button>
           ))}
         </div>
       )
+    case 'suggested_fields':
+      return <SuggestedFields block={block} disabled={disabled} onAction={onAction} />
     case 'tz_ready':
       return (
         <div className="card success">
@@ -73,6 +82,7 @@ function describeAction(block: Block): string {
     select_operations: 'выбраны операции',
     set_flag: 'изменено условие работ',
     set_field: 'заполнено поле',
+    suggest_fields: 'запрошены предложения по полям',
     tz_created: 'сформировано ТЗ',
     reset: 'начать заново',
   }
@@ -429,6 +439,36 @@ function SimilarCalcs({ block }: { block: Block }) {
   )
 }
 
+// Черновик полей ТЗ, извлечённый LLM из описания потребности в чате.
+// Ничего не применяется молча — каждое поле принимается пользователем
+// отдельной кнопкой, которая шлёт обычный set_field (тот же контракт,
+// что и ручной ввод в конструкторе).
+function SuggestedFields({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor'>) {
+  const [applied, setApplied] = useState<string[]>([])
+  return (
+    <div className="card hint">
+      <div className="card-title">{block.text}</div>
+      <ul className="plain">
+        {(block.items ?? []).map((item: BlockItem, i: number) => (
+          <li key={i}>
+            <strong>{item.label}</strong>: {item.value}{' '}
+            <button
+              className="btn small"
+              disabled={disabled || applied.includes(item.key)}
+              onClick={() => {
+                onAction({ type: 'set_field', key: item.key, value: item.value })
+                setApplied((prev) => [...prev, item.key])
+              }}
+            >
+              {applied.includes(item.key) ? 'Принято' : 'Принять'}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 function Recommendations({ block }: { block: Block }) {
   return (
     <div className="card hint">
@@ -464,8 +504,12 @@ export function TzGaps({ block }: { block: Block }) {
   )
 }
 
+export function readinessTone(value: number): 'ok' | 'mid' | 'low' {
+  return value >= 90 ? 'ok' : value >= 60 ? 'mid' : 'low'
+}
+
 export function Readiness({ value }: { value: number }) {
-  const tone = value >= 90 ? 'ok' : value >= 60 ? 'mid' : 'low'
+  const tone = readinessTone(value)
   return (
     <div className="readiness">
       <div className="bar">
