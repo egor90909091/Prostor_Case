@@ -82,16 +82,6 @@ docker compose up --build
 psql "$DSN" -v ON_ERROR_STOP=1 -f tests/sql_checks.sql   # проверки данных и ранжирования
 ```
 
-### Как это выглядит
-
-| | |
-|---|---|
-| ![Агент поиска](docs/screenshots/01-agent-search.png) | ![Исполнители](docs/screenshots/02-executors.png) |
-| Подбор услуг с обоснованием | Исполнители с рангом, загрузкой и объяснением |
-| ![Готовность](docs/screenshots/03-readiness.png) | ![Конструктор](docs/screenshots/04-constructor.png) |
-| Готовность ТЗ и риски прямо в диалоге | Конструктор, предзаполненный из диалога |
-
----
 
 ## Демо-сценарий за 90 секунд
 
