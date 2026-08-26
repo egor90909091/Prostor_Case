@@ -4,9 +4,9 @@ services:
   db:
     image: pgvector/pgvector:0.8.6-pg16-bookworm
     environment:
-      POSTGRES_USER: prostor
-      POSTGRES_PASSWORD: prostor
-      POSTGRES_DB: prostor
+      POSTGRES_USER: ${POSTGRES_USER:-prostor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-prostor}
+      POSTGRES_DB: ${POSTGRES_DB:-prostor}
     # Скрипты выполняются по алфавиту (схема -> шаблоны ТЗ -> данные -> функции),
     # но ТОЛЬКО когда docker-entrypoint-initdb.d видит ПУСТОЙ pgdata volume —
     # это одноразовый bootstrap, а не система миграций. Правки в db/init не
@@ -21,7 +21,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U prostor -d prostor"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prostor} -d ${POSTGRES_DB:-prostor}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -50,9 +50,9 @@ services:
         PROJECT: Prostor.Chat
     environment:
       PGHOST: db
-      PGDATABASE: prostor
-      PGUSER: prostor
-      PGPASSWORD: prostor
+      PGDATABASE: ${POSTGRES_DB:-prostor}
+      PGUSER: ${POSTGRES_USER:-prostor}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-prostor}
       TZ_BASE_URL: http://tz:8080
       # LLM (чат): пусто -> шаблонный "стенограф" без внешних вызовов.
       # Любой OpenAI-совместимый chat/completions endpoint; сейчас — DeepSeek.
@@ -93,9 +93,9 @@ services:
         PROJECT: Prostor.Tz
     environment:
       PGHOST: db
-      PGDATABASE: prostor
-      PGUSER: prostor
-      PGPASSWORD: prostor
+      PGDATABASE: ${POSTGRES_DB:-prostor}
+      PGUSER: ${POSTGRES_USER:-prostor}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-prostor}
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}

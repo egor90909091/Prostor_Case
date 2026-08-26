@@ -29,6 +29,11 @@ docker compose up --build          # ~3 минуты на первую сбор�
 | MinIO console | http://localhost:9001 (`minioadmin` / `minioadmin`) |
 | PostgreSQL | `localhost:5432`, `prostor` / `prostor` |
 
+Логин/пароль БД и MinIO — значения по умолчанию для локального прототипа,
+заданы в `docker-compose.yml` через `${POSTGRES_USER:-prostor}` и подобные
+подстановки. Переопределяются через `.env` (см. `.env.example`), в самом
+compose-файле никаких кредов не захардкожено.
+
 База инициализируется автоматически: схема → шаблоны ТЗ → данные выгрузки → функции поиска —
 это скрипты `db/init/*.sql`, которые официальный образ Postgres выполняет по алфавиту
 через `docker-entrypoint-initdb.d`, но **только когда `pgdata` volume пустой** (это разовый
@@ -80,6 +85,10 @@ docker compose up --build
 ```bash
 ./tests/smoke.sh                                   # сквозной сценарий по API
 psql "$DSN" -v ON_ERROR_STOP=1 -f tests/sql_checks.sql   # проверки данных и ранжирования
+
+# Unit-тесты backend (xUnit, без докера и без БД)
+dotnet test backend/tests/Prostor.Chat.Tests
+dotnet test backend/tests/Prostor.Tz.Tests
 ```
 
 
@@ -107,7 +116,7 @@ psql "$DSN" -v ON_ERROR_STOP=1 -f tests/sql_checks.sql   # проверки да
 
 ```
 React (nginx)
-  │  POST /turns — долгий HTTP со стримом SSE, без WebSocket
+  │  POST /turns (SSE) или один WebSocket на сессию — оба ведут в один и тот же обработчик хода
   ▼
 Chat Service (C#)            ──синхронный HTTP──▶   TZ Generator (C#)
   slot filling, поиск, ранжирование                  готовность, риски, docx
@@ -116,8 +125,11 @@ Chat Service (C#)            ──синхронный HTTP──▶   TZ Gener
 PostgreSQL  pgvector                             PostgreSQL     MinIO S3
 ```
 
-Ни брокера, ни outbox, ни Redis, ни WebSocket — обоснование в
-[`docs/architecture.md`](docs/architecture.md).
+Ни брокера, ни outbox, ни Redis — обоснование в [`docs/architecture.md`](docs/architecture.md).
+WebSocket есть, но не про server push: сервер по-прежнему ничего не инициирует
+вне хода пользователя, сокет — это просто один канал на сессию вместо нового
+HTTP-соединения на каждый ход. Оба транспорта (SSE и WebSocket) вызывают одно и
+то же тело обработчика хода и одинаково защищены `Idempotency-Key`.
 
 ### Один ход диалога
 
@@ -147,14 +159,18 @@ Chat Service stateless: переживает рестарт в середине 
 горизонтально. Смена слота каскадно сбрасывает зависимые — правило описано один раз
 в `ChatState.ResetFrom`.
 
-### Долгое HTTP без WebSocket
+### Два транспорта для одного хода
 
-Один ход = один `POST`, ответ идёт потоком SSE-кадров (`meta`, `delta`, `block`,
-`state`, `done`). Сервер ничего не инициирует вне хода пользователя, поэтому
-двусторонний канал не нужен. Обрыв соединения не теряет ход: события пишутся
-в `chat.turn.events`, клиент добирает их через
-`GET /turns/{turnId}/stream?fromSeq=N`. Повтор с тем же `Idempotency-Key`
-не выполняет ход второй раз, параллельный ход в одной сессии получает `409`.
+SSE: один ход = один `POST`, ответ идёт потоком кадров (`meta`, `delta`, `block`,
+`state`, `done`). WebSocket: один сокет на сессию, клиент шлёт кадр запроса на
+каждый ход, сервер отвечает теми же именованными кадрами — без открытия нового
+HTTP-соединения на каждый ход. Оба сводятся к одной и той же функции обработки
+хода, различается только sink, в который пишутся события. Сервер по-прежнему
+ничего не инициирует вне хода пользователя. Обрыв соединения не теряет ход:
+события пишутся в `chat.turn.events`, клиент добирает их через
+`GET /turns/{turnId}/stream?fromSeq=N` (для SSE) либо переподключением к `/ws`.
+Повтор с тем же `Idempotency-Key` не выполняет ход второй раз, а отдаёт
+сохранённые события; параллельный ход в одной сессии получает `409`.
 
 ---
 
@@ -261,12 +277,17 @@ score = (0.35·опыт_по_услуге + 0.30·(1−загрузка) + 0.25�
 ## Структура репозитория
 
 ```
-db/init/          01 схема · 02 шаблоны ТЗ · 03 данные (статичный seed) · 04 функции поиска
+db/init/          01 схема · 02 шаблоны ТЗ · 03 данные (статичный seed) · 04 функции поиска ·
+                  05 классификация шаблон→услуга · 06 версии документов (parent_tz_id) ·
+                  07 статус документа (черновик/финал)
 backend/src/
   Prostor.Chat/   агент: slot filling, поиск, ранжирование, стриминг, аналитика, индексатор
   Prostor.Tz/     конструктор: черновик, готовность, риски, сборка docx, MinIO
+backend/tests/
+  Prostor.Chat.Tests/  xUnit-тесты Chat Service
+  Prostor.Tz.Tests/    xUnit-тесты TZ Generator (DSL рисков, готовность, docx, разделы)
 frontend/src/     React: чат с блоками, конструктор ТЗ, аналитика
-tests/            smoke.sh · sql_checks.sql
+tests/            smoke.sh · sql_checks.sql — сквозные проверки через API и SQL
 docs/             архитектура и решения
 ```
 
@@ -280,12 +301,16 @@ docs/             архитектура и решения
 |---|---|---|
 | `POST` | `/api/v1/chat/sessions` | создать сессию |
 | `POST` | `/api/v1/chat/sessions/{id}/turns` | ход диалога, ответ — поток SSE |
+| `GET` | `/api/v1/chat/sessions/{id}/ws` | тот же ход диалога, но по WebSocket: один сокет на всю сессию вместо нового HTTP-соединения на каждый ход (см. «Один ход диалога» ниже) |
 | `GET` | `/api/v1/chat/sessions/{id}` | история и состояние |
 | `GET` | `/api/v1/chat/sessions/{id}/state` | полное состояние для конструктора |
-| `GET` | `/api/v1/chat/sessions/{id}/turns/{turnId}/stream?fromSeq=N` | дострим после обрыва |
+| `GET` | `/api/v1/chat/sessions/{id}/turns/{turnId}/stream?fromSeq=N` | дострим после обрыва (SSE-транспорт) |
 | `POST` | `/api/v1/catalog/products/search` | гибридный поиск услуг |
-| `GET` | `/api/v1/catalog/products/{id}/stages` \| `/operations` \| `/related` \| `/similar` | состав услуги и история |
-| `POST` | `/api/v1/executors/search` | подбор исполнителей с обоснованием |
+| `GET` | `/api/v1/catalog/products/{id}` | карточка услуги |
+| `GET` | `/api/v1/catalog/products/{id}/stages` \| `/operations` \| `/related` \| `/similar` \| `/risks` | состав услуги, история, похожие услуги, типовые риски |
+| `POST` | `/api/v1/executors/discover` | подбор исполнителей без услуги/периода — по профилю и истории работ |
+| `POST` | `/api/v1/executors/search` | подбор исполнителей с обоснованием (услуга + период) |
+| `POST` | `/api/v1/review/draft` | LLM-ревью черновика ТЗ (замечания по тексту) |
 | `GET` | `/api/v1/analytics/overview` | витрины аналитики |
 
 ### TZ Generator — `:8081`
@@ -294,8 +319,10 @@ docs/             архитектура и решения
 |---|---|---|
 | `GET` | `/api/v1/tz/templates` | шаблоны и веса полей |
 | `POST` | `/api/v1/tz/drafts` | черновик: готовность, риски, разделы (без побочных эффектов) |
-| `POST` | `/api/v1/tz/documents` | сборка `.docx`, запись в MinIO и БД |
+| `POST` | `/api/v1/tz/documents` | сборка `.docx`, запись в MinIO и БД; `parentTzId` — новая версия существующего документа, `asDraft` — сохранить без финализации |
+| `GET` | `/api/v1/tz/documents` | список документов |
 | `GET` | `/api/v1/tz/documents/{id}` \| `/file` | метаданные и выгрузка файла |
+| `GET` | `/api/v1/tz/documents/{id}/versions` | история версий документа (`parent_tz_id`) |
 | `POST` | `/internal/tz/draft` | тот же черновик для вызова из Chat Service |
 
 Пример хода диалога:
@@ -346,7 +373,9 @@ data: {"turnId":"..."}
   отдельного календаря загрузки в выгрузке нет.
 * Расценки загружены (`catalog.price`), но расчёт стоимости в MVP не реализован —
   это следующая итерация, данные для неё уже в схеме.
-* Версионирование ТЗ есть в схеме (`tz.document.version`), UI редактирования
-  ранее созданного документа — следующая итерация.
+* Версионирование ТЗ реализовано: новый документ можно создать как новую версию
+  существующего (`parentTzId`) или сохранить черновиком без финализации
+  (`asDraft`), история версий — `GET /api/v1/tz/documents/{id}/versions` и вкладка
+  «Мои заявки» в интерфейсе.
 * Файл в MinIO не обязателен: если хранилище недоступно, документ фиксируется в БД
   и пересобирается из `payload` при скачивании.
