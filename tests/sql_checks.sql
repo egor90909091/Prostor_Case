@@ -138,4 +138,42 @@ BEGIN
     RAISE NOTICE 'веса полей готовности дают ровно 100%%';
 END $$;
 
+-- Согласование ТЗ: тред и направления держатся на одном корне цепочки версий
+DO $$
+DECLARE v_bad int; v_orphan int;
+BEGIN
+    -- root_tz_id направления обязан совпадать с корнем версии документа:
+    -- иначе после правок по замечаниям обсуждение разъедется по версиям.
+    SELECT count(*) INTO v_bad
+    FROM tz.assignment a
+    JOIN tz.document d ON d.tz_id = a.tz_id
+    WHERE a.root_tz_id <> coalesce(d.parent_tz_id, d.tz_id);
+    IF v_bad > 0 THEN
+        RAISE EXCEPTION 'направлений с чужим корнем цепочки версий: %', v_bad;
+    END IF;
+
+    -- Замечание всегда лежит в том же треде, что и направление, по которому
+    -- оно оставлено.
+    SELECT count(*) INTO v_orphan
+    FROM tz.comment c
+    JOIN tz.assignment a ON a.assignment_id = c.assignment_id
+    WHERE c.root_tz_id <> a.root_tz_id;
+    IF v_orphan > 0 THEN
+        RAISE EXCEPTION 'замечаний вне треда своего направления: %', v_orphan;
+    END IF;
+
+    RAISE NOTICE 'согласование: % направлений, % замечаний, треды сходятся',
+        (SELECT count(*) FROM tz.assignment), (SELECT count(*) FROM tz.comment);
+END $$;
+
+-- Вердикт подрядчика всегда с причиной и всегда с решением
+DO $$
+DECLARE v_bad int;
+BEGIN
+    SELECT count(*) INTO v_bad FROM tz.comment
+    WHERE kind = 'decision' AND (decision IS NULL OR btrim(text) = '');
+    IF v_bad > 0 THEN RAISE EXCEPTION 'вердиктов без решения или без текста: %', v_bad; END IF;
+    RAISE NOTICE 'все вердикты подрядчиков содержат решение и текст';
+END $$;
+
 \echo 'Все SQL-проверки пройдены'

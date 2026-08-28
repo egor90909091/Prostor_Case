@@ -118,16 +118,30 @@ SIZE=$(stat -c%s /tmp/smoke_tz.docx)
 head -c 2 /tmp/smoke_tz.docx | grep -q 'PK' || fail "docx не является zip-архивом"
 echo "документ скачан: $SIZE байт, /tmp/smoke_tz.docx"
 
+# Тот же документ в PDF. Формат собирается на лету из payload, в хранилище его
+# нет, поэтому проверка отдельная. Без шрифта с кириллицей сервис отвечает 503 —
+# это ограничение окружения (см. /health -> pdf), а не провал сценария.
+PDF_STATE=$(curl -sf "$TZ/health" | jq -r '.pdf')
+if [ "$PDF_STATE" = "ready" ]; then
+  curl -sf "$TZ/api/v1/tz/documents/$TZ_ID/file?format=pdf" -o /tmp/smoke_tz.pdf
+  PDF_SIZE=$(stat -c%s /tmp/smoke_tz.pdf)
+  head -c 5 /tmp/smoke_tz.pdf | grep -q '%PDF' || fail "pdf не является PDF-файлом"
+  [ "$PDF_SIZE" -gt 5000 ] || fail "pdf подозрительно мал ($PDF_SIZE байт)"
+  echo "тот же документ в PDF: $PDF_SIZE байт, /tmp/smoke_tz.pdf"
+else
+  echo "предупреждение: шрифт для PDF недоступен (health.pdf=$PDF_STATE), проверку PDF пропускаем"
+fi
+
 say "аналитика"
 curl -sf "$CHAT/api/v1/analytics/overview" | jq -r '"создано ТЗ: \(.tzCreated), средняя готовность: \(.tzAvgReadiness)%"'
 
-say "роутер: свободный текст либо консультация, либо поиск услуг"
+say "диалог: свободный текст либо разговор, либо поиск услуг"
 LLM_KIND=$(curl -sf "$CHAT/health" | jq -r '.llm')
 echo "LLM: $LLM_KIND"
 
 SESSION2=$(curl -sf -X POST "$CHAT/api/v1/chat/sessions" \
   -H 'Content-Type: application/json' -d '{"customerName":"SmokeRouter"}' | jq -r '.sessionId')
-[ -n "$SESSION2" ] || fail "сессия для роутера не создана"
+[ -n "$SESSION2" ] || fail "сессия для проверки диалога не создана"
 
 turn2() {
   curl -sN -X POST "$CHAT/api/v1/chat/sessions/$SESSION2/turns" \
@@ -136,30 +150,38 @@ turn2() {
 }
 
 # Предметный запрос — это то же сообщение, что уже надёжно возвращает результаты
-# в начале скрипта. Роутер (или его заглушка) должен передать управление поиску:
-# ждём блок product_list. Это единственная жёсткая проверка в блоке — формулировка
-# однозначна, и системный промпт роутера прямо требует вызвать search_services
-# именно на таком сообщении.
+# в начале скрипта. Мозг диалога (или его детерминированная замена без ключа)
+# должен передать управление поиску: ждём блок product_list. Это единственная
+# жёсткая проверка в блоке — формулировка однозначна, и системный промпт прямо
+# требует intent=search_services именно на таком сообщении.
 SEARCH_RAW=$(turn2 search '{"text":"нужно оценить запасы по объекту"}')
 echo "$SEARCH_RAW" | grep -q '"type":"product_list"' \
   || fail "предметная реплика не привела к поиску услуг (нет блока product_list)"
 echo "предметная реплика -> получен product_list"
 
-# Консультационную реплику мягко проверяем только против реальной модели: заглушка
-# LLM не умеет вести диалог и намеренно всегда выбирает поиск (см. StubLlm.DecideAsync
-# и docs/architecture.md §2.1) — на ней эта проверка ничего не говорит о роутере.
-# Против настоящей модели решение — это её суждение, а не детерминированный код,
-# поэтому расхождение здесь предупреждение, а не fail(): не хотим ронять CI из-за
-# того, что модель в отдельном случае восприняла реплику иначе, чем ожидалось.
+# Разговорную реплику мягко проверяем только против реальной модели: без ключа
+# ход идёт по детерминированной ветке Brain.Fallback, которая до выбора услуги
+# намеренно считает поиском любой текст (см. docs/architecture.md §2.1) — на ней
+# эта проверка ничего не говорит о качестве диалога. Против настоящей модели
+# решение — это её суждение, а не детерминированный код, поэтому расхождение
+# здесь предупреждение, а не fail(): не хотим ронять CI из-за того, что модель в
+# отдельном случае восприняла реплику иначе, чем ожидалось.
 if [ "$LLM_KIND" != "stub" ]; then
   CONSULT_RAW=$(turn2 consult '{"text":"расскажи, как вообще устроен процесс подбора услуги — с чего лучше начать?"}')
   if echo "$CONSULT_RAW" | grep -q '"type":"product_list"'; then
-    echo "предупреждение: консультационная реплика привела к поиску услуг — роутер решил иначе, чем ожидалось"
+    echo "предупреждение: разговорная реплика привела к поиску услуг — модель решила иначе, чем ожидалось"
   else
-    echo "консультационная реплика -> ответ текстом без поиска"
+    echo "разговорная реплика -> ответ текстом без поиска"
+  fi
+  # Подсказки следующей реплики — часть паттерна диалога: система должна сама
+  # предлагать, чем продолжить, а не ждать, пока пользователь угадает формат.
+  if echo "$CONSULT_RAW" | grep -q '"type":"suggestions"'; then
+    echo "разговорная реплика -> есть подсказки следующего шага"
+  else
+    echo "предупреждение: модель не вернула подсказок (suggestions) — не критично, но паттерн беднее"
   fi
 else
-  echo "LLM — заглушка: проверку консультации пропускаем, заглушка всегда выбирает поиск"
+  echo "LLM — заглушка: проверку разговора пропускаем, без ключа любой текст до выбора услуги это поиск"
 fi
 
 say "качество поиска: доказательства и уверенность"
@@ -197,5 +219,59 @@ DISC=$(curl -sf -X POST "$CHAT/api/v1/executors/discover" \
   -d '{"query":"кто может пробурить скважину","topK":5}')
 echo "$DISC" | jq -r '.items[] | "  \(.rank). \(.name)  score=\(.score)  работ=\(.calcsCnt)  слова=\(.matchedTerms|join(","))"'
 echo "$DISC" | jq -e '.items | length > 0' >/dev/null || fail "исполнители по способностям не находятся"
+
+say "согласование ТЗ подрядчиком"
+# Полный цикл роли подрядчика: заказчик направляет документ, подрядчик его
+# открывает, вешает замечание на раздел и возвращает на доработку.
+# Роль передаётся заголовком X-Prostor-Actor и на сервере не проверяется —
+# это демо-контекст, а не авторизация (см. docs/architecture.md).
+COMPANIES=$(curl -sf "$CHAT/api/v1/catalog/companies")
+COMPANY_ID=$(echo "$COMPANIES" | jq -r '.items[0].companyId')
+COMPANY_NAME=$(echo "$COMPANIES" | jq -r '.items[0].name')
+[ -n "$COMPANY_ID" ] && [ "$COMPANY_ID" != "null" ] || fail "справочник компаний пуст"
+
+SEND=$(curl -sf -X POST "$TZ/api/v1/tz/documents/$TZ_ID/assignments" \
+  -H 'Content-Type: application/json' -H 'X-Prostor-Actor: customer:ntc' \
+  -d "{\"companyIds\":[\"$COMPANY_ID\"],\"note\":\"Просим согласовать\"}")
+echo "$SEND" | jq -e '.created >= 1' >/dev/null || fail "ТЗ не удалось направить подрядчику"
+echo "направлено: $COMPANY_NAME"
+
+INBOX=$(curl -sf "$TZ/api/v1/tz/inbox" -H "X-Prostor-Actor: contractor:$COMPANY_ID")
+ASSIGNMENT=$(echo "$INBOX" | jq -r --arg tz "$TZ_ID" '.items[] | select(.tzId == $tz) | .assignmentId')
+[ -n "$ASSIGNMENT" ] || fail "направленное ТЗ не появилось во входящих подрядчика"
+echo "входящих у подрядчика: $(echo "$INBOX" | jq '.items | length')"
+
+curl -sf -X POST "$TZ/api/v1/tz/assignments/$ASSIGNMENT/view" \
+  -H "X-Prostor-Actor: contractor:$COMPANY_ID" | jq -e '.status == "viewed"' >/dev/null \
+  || fail "отметка о просмотре не проставилась"
+
+curl -sf -X POST "$TZ/api/v1/tz/documents/$TZ_ID/comments" \
+  -H 'Content-Type: application/json' -H "X-Prostor-Actor: contractor:$COMPANY_ID" \
+  -d '{"sectionKey":"perimeter","text":"Не указан объём выборки"}' \
+  | jq -e '[.items[] | select(.sectionKey == "perimeter")] | length > 0' >/dev/null \
+  || fail "замечание к разделу не сохранилось"
+
+# Доработка без причины бессмысленна для заказчика — сервер обязан отказать.
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "$TZ/api/v1/tz/assignments/$ASSIGNMENT/decision" \
+  -H 'Content-Type: application/json' -H "X-Prostor-Actor: contractor:$COMPANY_ID" \
+  -d '{"decision":"revision","text":""}')
+[ "$CODE" = "422" ] || fail "доработка без причины принята (код $CODE)"
+
+curl -sf -X POST "$TZ/api/v1/tz/assignments/$ASSIGNMENT/decision" \
+  -H 'Content-Type: application/json' -H "X-Prostor-Actor: contractor:$COMPANY_ID" \
+  -d '{"decision":"revision","text":"Уточните объём выборки и сроки"}' \
+  | jq -e '.status == "revision"' >/dev/null || fail "решение не сохранилось"
+
+curl -sf "$TZ/api/v1/tz/documents/$TZ_ID/assignments" \
+  | jq -e --arg c "$COMPANY_ID" \
+    '[.items[] | select(.companyId == $c and .status == "revision")] | length > 0' >/dev/null \
+  || fail "заказчик не видит решения подрядчика"
+
+curl -sf "$TZ/api/v1/tz/documents?limit=50" \
+  | jq -e --arg tz "$TZ_ID" \
+    '[.items[] | select(.tzId == $tz and .reviewStatus == "revision")] | length > 0' >/dev/null \
+  || fail "сводный статус согласования не попал в список заявок"
+echo "цикл пройден: направлено -> просмотрено -> замечание -> на доработку"
 
 printf '\n\033[32mВсе проверки пройдены\033[0m\n'

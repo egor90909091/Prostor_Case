@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { renderAsync } from 'docx-preview'
 import {
-  createTzDocument, draftTz, getProductRisks, getStages, getTzDocument, getTemplates, reviewDraft,
+  createTzDocument, documentFileUrl, draftTz, getProductRisks, getStages, getTzDocument,
+  getTemplates, reviewDraft,
 } from './api'
 import type { ProductRisk, ReviewIssue } from './api'
-import { Readiness, severityLabel } from './Blocks'
-import { STATE_KEY_OVERRIDES, STATE_STORAGE_KEY, consumePendingFields } from './constructorStorage'
+import { DocxIcon, PdfIcon, Readiness, readinessTone, severityLabel } from './Blocks'
+import { STATE_KEY_OVERRIDES, STATE_STORAGE_KEY, consumePendingFields, subscribePendingFields } from './constructorStorage'
+import { SECTION_TITLES } from './sections'
+import { getChatSessionId, getCurrentDocument, setCurrentDocument, type WorkspaceDocument } from './workspace'
 
 interface Stage {
   key: string
@@ -24,6 +27,9 @@ interface Risk {
 
 interface FieldStatus {
   key: string
+  // Раздел ТЗ, к которому относится поле: по нему конструктор подсвечивает
+  // то, на что пожаловался подрядчик (замечание хранит section_key).
+  section: string
   title: string
   weight: number
   blocking: boolean
@@ -63,27 +69,95 @@ const TEXTAREA_FIELD_KEYS = new Set([
 
 // Конструктор не имеет бэкенд-сессии (как чат), поэтому состояние формы
 // хранится в localStorage: переключение вкладок и перезагрузка страницы
-// не теряют введённые данные. При редактировании существующего ТЗ
-// (editTzId) сохранение пропускается: state грузится из БД и не должен
-// перетирать черновик. STATE_KEY_OVERRIDES/STATE_STORAGE_KEY — в
-// constructorStorage.ts, тем же ключом ChatView патчит принятые в чате
-// LLM-подсказки (см. patchConstructorState).
+// не теряют введённые данные — в том числе при редактировании существующего
+// ТЗ, где сохранённое состояние это правки пользователя поверх payload из БД.
+// STATE_KEY_OVERRIDES/STATE_STORAGE_KEY — в constructorStorage.ts, тем же
+// ключом ChatView патчит принятые в чате LLM-подсказки.
 const INITIAL_STATE = { flags: {}, stages: [], executors: [], period: {} }
 
+// Пустая ли форма. Раньше признаком «пользователь уже работал с формой» было
+// само наличие ключа в localStorage, но конструктор теперь смонтирован с
+// самого старта приложения и записывает туда пустое состояние сразу — ключ
+// появлялся раньше, чем пользователь успевал что-либо ввести, и данные из
+// диалога переставали переноситься вовсе. Смотрим на содержимое, а не на факт
+// записи.
+function isBlankState(state: any): boolean {
+  if (!state) return true
+  if (state.productId || state.templateId) return false
+  if ((state.stages ?? []).length > 0 || (state.executors ?? []).length > 0) return false
+  if (state.period?.from || state.period?.to) return false
+  return !TEXT_STATE_KEYS.some((key) => String(state[key] ?? '').trim().length > 0)
+}
+
+const TEXT_STATE_KEYS = [
+  'customer', 'object', 'purpose', 'perimeter', 'sourceData', 'documentation', 'acceptance', 'other',
+]
+
+// Восстановление зоны готового документа из общего хранилища: конструктор
+// монтируется заново на каждом заходе на вкладку, а документ у заявки тот же.
+function resultOf(doc: WorkspaceDocument | null) {
+  if (!doc) return null
+  return {
+    tzId: doc.tzId,
+    downloadUrl: documentFileUrl(doc.tzId),
+    version: doc.version,
+    status: doc.status,
+  }
+}
+
+function editingOf(doc: WorkspaceDocument | null) {
+  if (!doc) return null
+  return {
+    tzId: doc.tzId,
+    version: doc.version,
+    createdAt: doc.createdAt,
+    parentTzId: doc.parentTzId,
+    status: doc.status,
+  }
+}
+
+// Название документа в зоне результата: объект работ информативнее названия
+// услуги («Приобское месторождение» вместо «Концепт обустройства»), но пока
+// объект не заполнен, показываем услугу или хотя бы имя шаблона.
+function docTitle(state: any, draft: DraftResponse | null): string {
+  return state?.object || state?.productName || draft?.templateName || 'Техническое задание'
+}
+
 export function ConstructorView({
-  sessionId,
-  editTzId,
+  sessionId: sessionIdProp,
+  editRequest,
+  chatRequest,
+  resetToken,
   onNavigateToDocuments,
+  onDocumentCreated,
 }: {
   sessionId: string | null
-  editTzId?: string | null
-  onNavigateToDocuments?: () => void
+  // Запрос на открытие существующего ТЗ: пара (id, момент клика). Момент нужен,
+  // потому что конструктор не размонтируется — повторный клик по тому же
+  // документу обязан снова перечитать его из БД.
+  // sectionKey — раздел из замечания подрядчика: форма подведёт к его полям
+  // и подсветит их, вместо того чтобы открыться с начала.
+  editRequest?: { tzId: string; at: number; sectionKey?: string } | null
+  // Запрос перенести данные диалога в форму — кнопка «Сформировать ТЗ» в чате.
+  chatRequest?: { sessionId: string; at: number } | null
+  // Растёт при «Начать заново» в чате: сигнал очистить форму и результат.
+  resetToken?: number
+  // tzId — чтобы «Мои заявки» открылись сразу на этом документе, а не на
+  // общем списке: сразу после формирования пользователю нужен именно он.
+  onNavigateToDocuments?: (tzId?: string) => void
+  // Сообщает наверх, что заявка получила готовый документ: App передаёт это
+  // в чат, чтобы он отметил ТЗ у себя в состоянии и в ленте диалога.
+  onDocumentCreated?: (tzId: string) => void
 }) {
+  // После перезагрузки страницы App не помнит, из какого диалога открыт
+  // конструктор, — берём указатель из общего хранилища. Иначе документ
+  // сохранялся бы без привязки к сессии, а предзаполнение из чата не работало
+  // бы вовсе.
+  const sessionId = sessionIdProp ?? getChatSessionId()
   const [state, setState] = useState<any>(() => {
-    // При редактировании существующего ТЗ — стартуем с пустого state,
-    // он загрузится из БД в эффекте ниже. Иначе — пробуем восстановить
-    // из localStorage, чтобы переключение вкладок и F5 не стирали форму.
-    if (editTzId) return INITIAL_STATE
+    // Стартуем с сохранённого состояния: оно и есть текущая работа
+    // пользователя. Открытие конкретного ТЗ из «Мои заявки» перезапишет его
+    // в эффекте ниже — но только по явному клику, а не на каждом заходе.
     try {
       const stored = localStorage.getItem(STATE_STORAGE_KEY)
       if (stored) return { ...INITIAL_STATE, ...JSON.parse(stored) }
@@ -94,12 +168,15 @@ export function ConstructorView({
   const [availableStages, setAvailableStages] = useState<Stage[]>([])
   const [productRisks, setProductRisks] = useState<ProductRisk[]>([])
   const [draft, setDraft] = useState<DraftResponse | null>(null)
+  // Документ текущей заявки живёт в workspace, а не только здесь: конструктор
+  // размонтируется при переключении вкладки, и без общего хранилища зона
+  // готового документа исчезала при первом же уходе в чат.
   const [result, setResult] = useState<{
     tzId: string
     downloadUrl: string
     version: number
     status: 'draft' | 'final'
-  } | null>(null)
+  } | null>(() => resultOf(getCurrentDocument()))
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [savingDraft, setSavingDraft] = useState(false)
@@ -116,6 +193,18 @@ export function ConstructorView({
   const [rendered, setRendered] = useState(false)
   const [renderError, setRenderError] = useState<string | null>(null)
   const previewHostRef = useRef<HTMLDivElement | null>(null)
+  // Зона готового документа: на неё уводит кнопка из липкой боковой панели,
+  // потому что после сохранения она может оказаться далеко внизу формы.
+  const resultRef = useRef<HTMLDivElement | null>(null)
+  // Раздел, к которому подрядчик оставил замечание: его поля подсвечиваются,
+  // и к первому из них конструктор проматывает форму. Сбрасывается, как
+  // только пользователь что-то правит — подсветка своё дело сделала.
+  //
+  // Вместе с ключом храним момент запроса: повторный клик по тому же
+  // замечанию — это новый запрос «покажи мне это место», и промотка должна
+  // сработать снова, хотя раздел не изменился.
+  const [focusSection, setFocusSection] =
+    useState<{ key: string; at: number } | null>(null)
   // Метаданные редактируемого документа: показываются бейджем в шапке,
   // а parentTzId прокидывается в createTzDocument, чтобы новая строка
   // стала версией, а не отдельным ТЗ.
@@ -125,124 +214,174 @@ export function ConstructorView({
     createdAt: string
     parentTzId?: string | null
     status?: 'draft' | 'final'
-  } | null>(null)
+  } | null>(() => editingOf(getCurrentDocument()))
 
-  // Предзаполнение конструктора идёт из одного из трёх источников
-  // (приоритет сверху вниз):
-  //   * editTzId — существующее ТЗ из «Мои заявки»: тащим payload из БД.
-  //   * sessionId — диалог с агентом: state приходит из chat.session.
-  //     Но только если в localStorage ещё нет сохранённого состояния —
-  //     иначе пользователь уже редактировал форму, и чат-данные не должны
-  //     её перетирать при переключении вкладок.
-  //   * localStorage — ранее сохранённое состояние формы.
-  // Шаблоны нужны всегда — без них конструктор не знает, какой набор
-  // полей рисовать.
+  // Шаблоны нужны всегда — без них конструктор не знает, какой набор полей
+  // рисовать. Загружаются один раз: набор шаблонов в рамках сессии не меняется.
   useEffect(() => {
-    // React.StrictMode в деве нарочно вызывает этот эффект дважды подряд
-    // (mount → cleanup → mount) — обе асинхронные ветки ниже без этого
-    // флага независимо резолвились бы и каждая писала бы setState поверх
-    // другой. Раньше это было безвредно (обе загружали одни и те же
-    // данные), но applyPending() ниже — деструктивное чтение очереди:
-    // при гонке первая резолвнувшаяся ветка забирала все накопленные
-    // поля, а setState второй ветки (без applyPending — очередь уже
-    // пуста) стирал их обратно. cancelled гарантирует, что применяется
-    // только результат актуального (последнего) запуска эффекта.
-    let cancelled = false
-
     getTemplates()
       .then((r) => setTemplates(r.items ?? []))
       .catch(() => setError('Сервис ТЗ недоступен'))
+  }, [])
 
-    // Поля, принятые как LLM-подсказки в чате, накапливаются в отдельной
-    // очереди (не в STATE_STORAGE_KEY напрямую — иначе преждевременно
-    // взвели бы hasStored ниже и обрезали загрузку из чата при первом
-    // открытии). Подмешиваем их поверх того состояния, которое реально
-    // загрузится — независимо от того, какая из трёх веток сработает.
-    const applyPending = () => {
-      const pending = consumePendingFields()
-      if (Object.keys(pending).length > 0) setState((prev: any) => ({ ...prev, ...pending }))
-    }
+  // Поля, принятые как LLM-подсказки в чате, накапливаются в отдельной очереди
+  // (не в STATE_STORAGE_KEY напрямую — иначе форма переставала бы считаться
+  // пустой и перенос данных из диалога обрезался бы). На монтировании
+  // подмешиваем накопленное поверх восстановленного состояния.
+  const applyPending = useCallback(() => {
+    const pending = consumePendingFields()
+    if (Object.keys(pending).length > 0) setState((prev: any) => ({ ...prev, ...pending }))
+  }, [])
 
-    if (editTzId) {
-      getTzDocument(editTzId)
-        .then((doc) => {
-          if (cancelled) return
-          // payload хранит исходный state плюс служебные поля (sections,
-          // readiness) — служебные убираем, они пересчитаются на draft.
-          const payload = doc.payload ?? {}
-          const { sections: _sections, readiness: _readiness, ...rest } = payload
-          void _sections
-          void _readiness
-          setState({ ...INITIAL_STATE, ...rest })
-          setEditing({
-            tzId: doc.tzId,
-            version: doc.version,
-            createdAt: doc.createdAt,
-            parentTzId: doc.parentTzId,
-            status: doc.status,
-          })
-          if (doc.productId) {
-            getStages(doc.productId)
-              .then((r) => setAvailableStages(r.items ?? []))
-              .catch(() => undefined)
-          }
-          applyPending()
-        })
-        .catch(() => setError('Не удалось загрузить ТЗ'))
-      return () => { cancelled = true }
-    }
+  useEffect(() => { applyPending() }, [applyPending])
 
-    // Если в localStorage уже есть сохранённое состояние — не грузим
-    // из чата: пользователь уже работал с формой, и его правки важнее
-    // данных диалога. Чат-данные грузятся только при первом открытии
-    // конструктора (когда localStorage пуст).
-    const hasStored = !!localStorage.getItem(STATE_STORAGE_KEY)
-    if (!sessionId || hasStored) {
-      applyPending()
-      return () => { cancelled = true }
-    }
+  // Всегда актуальное состояние формы для эффектов, которые не должны от него
+  // перезапускаться (перенос данных из диалога смотрит на него один раз).
+  const stateRef = useRef(state)
+  stateRef.current = state
 
-    fetch(`/api/v1/chat/sessions/${sessionId}/state`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((s) => {
+  // Загрузка существующего ТЗ — только по явному запросу из «Мои заявки».
+  // Не на каждом заходе на вкладку: конструктор теперь не размонтируется, и
+  // перечитывание payload затирало бы правки, сделанные после открытия.
+  useEffect(() => {
+    if (!editRequest) return
+    setFocusSection(
+      editRequest.sectionKey ? { key: editRequest.sectionKey, at: editRequest.at } : null)
+    // React.StrictMode в деве вызывает эффект дважды (mount → cleanup → mount);
+    // applyPending — деструктивное чтение очереди, поэтому применяем только
+    // результат актуального запуска.
+    let cancelled = false
+
+    getTzDocument(editRequest.tzId)
+      .then((doc) => {
         if (cancelled) return
-        if (!s) {
-          applyPending()
+        // payload хранит исходный state плюс служебные поля (sections,
+        // readiness) — служебные убираем, они пересчитаются на draft.
+        const payload = doc.payload ?? {}
+        const { sections: _sections, readiness: _readiness, ...rest } = payload
+        void _sections
+        void _readiness
+        setState({ ...INITIAL_STATE, ...rest })
+        setEditing({
+          tzId: doc.tzId,
+          version: doc.version,
+          createdAt: doc.createdAt,
+          parentTzId: doc.parentTzId,
+          status: doc.status,
+        })
+        // Открытое из «Мои заявки» ТЗ становится текущим документом заявки —
+        // иначе чат и конструктор показывали бы разные документы.
+        setCurrentDocument({
+          tzId: doc.tzId,
+          version: doc.version,
+          status: doc.status ?? 'final',
+          readiness: doc.readiness ?? 0,
+          title: rest.object || rest.productName || 'Техническое задание',
+          templateId: doc.templateId,
+          parentTzId: doc.parentTzId,
+          createdAt: doc.createdAt,
+        })
+        setResult({
+          tzId: doc.tzId,
+          downloadUrl: documentFileUrl(doc.tzId),
+          version: doc.version,
+          status: doc.status ?? 'final',
+        })
+        if (doc.productId) {
+          getStages(doc.productId)
+            .then((r) => setAvailableStages(r.items ?? []))
+            .catch(() => undefined)
+        }
+        applyPending()
+      })
+      .catch(() => { if (!cancelled) setError('Не удалось загрузить ТЗ') })
+
+    return () => { cancelled = true }
+    // at, а не tzId: повторный клик по тому же документу — тоже запрос
+    // перечитать его из БД.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editRequest?.at])
+
+  // Предзаполнение из диалога — по кнопке «Сформировать ТЗ» в чате, а не при
+  // старте приложения: до клика пользователь может ещё даже не выбрать услугу,
+  // и ранняя загрузка пустого состояния взвела бы hasStored, навсегда закрыв
+  // передачу данных из чата.
+  useEffect(() => {
+    if (!chatRequest) return
+    // Форма уже заполнена — правки пользователя важнее данных диалога.
+    if (!isBlankState(stateRef.current)) {
+      applyPending()
+      return
+    }
+
+    let cancelled = false
+    fetch(`/api/v1/chat/sessions/${chatRequest.sessionId}/state`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((chatState) => {
+        if (cancelled || !chatState) {
+          if (!cancelled) applyPending()
           return
         }
-        setState({ ...INITIAL_STATE, ...s })
-        if (s.productId) getStages(s.productId).then((r) => setAvailableStages(r.items ?? []))
+        setState({ ...INITIAL_STATE, ...chatState })
+        if (chatState.productId) {
+          getStages(chatState.productId)
+            .then((r) => setAvailableStages(r.items ?? []))
+            .catch(() => undefined)
+        }
         applyPending()
       })
       .catch(() => { if (!cancelled) applyPending() })
 
     return () => { cancelled = true }
-  }, [sessionId, editTzId])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatRequest?.at])
 
-  // Сохраняем состояние формы в localStorage на каждое изменение.
-  // Пропускаем только режим редактирования существующего ТЗ — там
-  // state грузится из БД и не должен перетирать черновик пользователя.
+  // Сохраняем состояние формы в localStorage на каждое изменение — включая
+  // режим редактирования существующего ТЗ: сохранённое состояние это и есть
+  // текущая работа пользователя, и после F5 он должен увидеть свои правки, а
+  // не исходный payload документа.
   useEffect(() => {
-    if (editTzId) return
     try {
       localStorage.setItem(STATE_STORAGE_KEY, JSON.stringify(state))
     } catch { /* переполнение storage — не критично */ }
-  }, [state, editTzId])
+  }, [state])
+
+  // Сброс заявки из чата. Первый проход пропускаем: эффект срабатывает и на
+  // монтировании, а чистить только что восстановленное состояние нельзя.
+  const knownResetToken = useRef(resetToken)
+  useEffect(() => {
+    if (knownResetToken.current === resetToken) return
+    knownResetToken.current = resetToken
+    setState(INITIAL_STATE)
+    setResult(null)
+    setEditing(null)
+    setDraft(null)
+    setAiIssues(null)
+    setError(null)
+  }, [resetToken])
+
+  // Поля, принятые в чате уже после первого монтирования конструктора:
+  // раньше они ждали перезагрузки страницы, потому что очередь читалась
+  // только на монтировании, а теперь конструктор живёт всё время сессии.
+  useEffect(() => subscribePendingFields(() => {
+    const pending = consumePendingFields()
+    if (Object.keys(pending).length > 0) setState((prev: any) => ({ ...prev, ...pending }))
+  }), [])
 
   // Подгружаем этапы услуги при появлении productId в state — нужно,
   // чтобы чек-лист этапов не был пустым после восстановления из localStorage
   // (тогда чат-эффект выше не выполняется и stages сами не подтянутся).
   useEffect(() => {
     const productId = state.productId
-    if (!productId || editTzId) return
+    if (!productId) return
     // Не перезапрашиваем, если уже есть — например, после загрузки из чата.
     if (availableStages.length > 0) return
     getStages(productId)
       .then((r) => setAvailableStages(r.items ?? []))
       .catch(() => undefined)
-  }, [state.productId, editTzId, availableStages.length])
+  }, [state.productId, availableStages.length])
 
-  // Типичные риски по услуге — независимо от editTzId/sessionId, запрос
+  // Типичные риски по услуге — независимо от источника состояния, запрос
   // дешёвый и идемпотентный, отдельного гейта на «уже загружено» не нужно.
   useEffect(() => {
     const productId = state.productId
@@ -315,6 +454,9 @@ export function ConstructorView({
   // в заблуждение. Пользователь пересохранит — увидит свежую версию.
   const update = (patch: any) => {
     setResult(null)
+    // Пользователь взялся за форму — подсветка раздела из замечания своё
+    // дело сделала и дальше только мешает.
+    setFocusSection(null)
     setState((prev: any) => ({ ...prev, ...patch }))
   }
 
@@ -431,15 +573,33 @@ export function ConstructorView({
         version: response.body.version,
         status,
       })
+      const createdAt = new Date().toISOString()
+      const parentTzId = rootTzId ?? response.body.tzId
       setEditing({
         tzId: response.body.tzId,
         version: response.body.version,
-        createdAt: new Date().toISOString(),
+        createdAt,
         // Корень цепочки не меняется при следующих сохранениях —
         // новая версия тоже ссылается на него.
-        parentTzId: rootTzId ?? response.body.tzId,
+        parentTzId,
         status,
       })
+      // Один документ на всю заявку: карточка в чате, предвыбор в «Мои
+      // заявки» и зона результата читают отсюда, а не каждый своё.
+      setCurrentDocument({
+        tzId: response.body.tzId,
+        version: response.body.version,
+        status,
+        readiness: response.body.readiness ?? draft?.readiness ?? 0,
+        title: docTitle(state, draft),
+        templateId,
+        parentTzId,
+        createdAt,
+      })
+      // Готовый (не черновик) документ — событие для всей заявки: чат
+      // отмечает его отдельным ходом, чтобы и состояние сессии на сервере,
+      // и сам диалог знали, что ТЗ сформировано.
+      if (!asDraft) onDocumentCreated?.(response.body.tzId)
     } else if (response.status === 422) {
       setError('ТЗ не готово к выгрузке: устраните критичные риски')
     } else if (response.status === 500) {
@@ -478,6 +638,30 @@ export function ConstructorView({
     [draft?.fields],
   )
 
+  // Поля раздела, к которому подрядчик оставил замечание. Состав разделов
+  // приходит из шаблона (required_fields.section), поэтому связка
+  // «замечание → поля» не зашита на фронте.
+  const flaggedKeys = useMemo(
+    () => new Set(
+      focusSection
+        ? (draft?.fields ?? []).filter((f) => f.section === focusSection.key).map((f) => f.key)
+        : [],
+    ),
+    [draft?.fields, focusSection],
+  )
+
+  // Промотка к первому полю раздела — после того, как черновик приехал с
+  // сервера и поля отрисованы.
+  useEffect(() => {
+    if (!focusSection || flaggedKeys.size === 0) return
+    const first = textFields.find((f) => flaggedKeys.has(f.key))
+    if (!first) return
+    document.getElementById(`field-${first.key}`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    // Один раз на запрос: дальше пользователь двигает форму сам.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSection?.at, flaggedKeys.size])
+
   return (
     <div className="constructor">
       <div className="col main">
@@ -493,6 +677,14 @@ export function ConstructorView({
           <div className="banner">
             Откройте конструктор из чата, чтобы поля заполнились автоматически.
             Сейчас доступно ручное заполнение.
+          </div>
+        )}
+        {focusSection && flaggedKeys.size > 0 && (
+          <div className="banner warn">
+            Подрядчик оставил замечание к разделу
+            «{SECTION_TITLES[focusSection.key] ?? focusSection.key}» —
+            поля раздела подсвечены ниже. После правок сохраните ТЗ новой версией
+            и направьте его повторно.
           </div>
         )}
         {error && <div className="banner error">{error}</div>}
@@ -676,7 +868,11 @@ export function ConstructorView({
           {textFields.map((field) => {
             const stateKey = STATE_KEY_OVERRIDES[field.key] ?? field.key
             return (
-              <div className="field" key={field.key}>
+              <div
+                className={`field${flaggedKeys.has(field.key) ? ' flagged' : ''}`}
+                id={`field-${field.key}`}
+                key={field.key}
+              >
                 <label>{field.title}{field.blocking && <span className="req"> *</span>}</label>
                 {TEXTAREA_FIELD_KEYS.has(field.key) ? (
                   <textarea
@@ -726,28 +922,77 @@ export function ConstructorView({
         )}
 
         {result && (
-          <section className="card">
-            <div className="card-title">
-              {result.status === 'draft' && <span className="badge draft">Черновик</span>}{' '}
-              {result.status === 'draft' ? 'Сохранённый черновик' : 'Готовый документ'}
-              {result.version ? ` · v${result.version}` : ''}
-            </div>
-            <div className="card-sub">
-              Так документ будет выглядеть в Word. Можно скачать{onNavigateToDocuments ? ' или перейти к списку заявок.' : '.'}
-            </div>
-            {onNavigateToDocuments && (
-              <button type="button" className="btn small ghost" onClick={onNavigateToDocuments}>
-                К списку заявок
-              </button>
-            )}
-            {renderError && (
-              <div className="banner error">
-                Не удалось отрисовать документ: {renderError}.
-                <a href={result.downloadUrl}>Скачать .docx</a>
+          <section className="card doc-ready" ref={resultRef}>
+            <div className="doc-ready-head">
+              <div className="doc-ready-icon" aria-hidden="true">
+                <DocxIcon />
               </div>
-            )}
-            {!rendered && !renderError && <p className="muted small">Рендерю документ…</p>}
-            <div className="docx-host" ref={previewHostRef} />
+              <div className="doc-ready-title">
+                <div className="doc-ready-label">
+                  {result.status === 'draft' ? 'Черновик сохранён' : 'Документ сформирован'}
+                </div>
+                <h3>{docTitle(state, draft)}</h3>
+                <div className="doc-ready-meta">
+                  <span className={`badge ${result.status === 'draft' ? 'draft' : 'ok'}`}>
+                    {result.status === 'draft' ? 'Черновик' : 'Готово'}
+                  </span>
+                  {result.version ? <span className="badge neutral">Версия {result.version}</span> : null}
+                  <span className={`badge ${readinessTone(draft?.readiness ?? 0)}`}>
+                    Готовность {draft?.readiness ?? 0}%
+                  </span>
+                  <span className="muted small">
+                    {new Date().toLocaleString('ru-RU', {
+                      day: '2-digit', month: '2-digit', year: 'numeric',
+                      hour: '2-digit', minute: '2-digit',
+                    })}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="doc-ready-files">
+              <a className="file-card docx" href={documentFileUrl(result.tzId)} download>
+                <span className="file-card-icon"><DocxIcon /></span>
+                <span className="file-card-body">
+                  <strong>Скачать .docx</strong>
+                  <span className="muted small">Word — для правок</span>
+                </span>
+              </a>
+              <a className="file-card pdf" href={documentFileUrl(result.tzId, 'pdf')} download>
+                <span className="file-card-icon"><PdfIcon /></span>
+                <span className="file-card-body">
+                  <strong>Скачать .pdf</strong>
+                  <span className="muted small">Для печати и подписи</span>
+                </span>
+              </a>
+              {onNavigateToDocuments && (
+                <button
+                  type="button"
+                  className="file-card go"
+                  onClick={() => onNavigateToDocuments(result.tzId)}
+                >
+                  <span className="file-card-icon" aria-hidden="true">→</span>
+                  <span className="file-card-body">
+                    <strong>Открыть в «Мои заявки»</strong>
+                    <span className="muted small">Этот документ, история версий и печать</span>
+                  </span>
+                </button>
+              )}
+            </div>
+
+            <div className="doc-ready-preview">
+              <div className="doc-ready-preview-head">
+                <span className="muted small">Предпросмотр — так документ выглядит в Word</span>
+                {!rendered && !renderError && <span className="muted small">Рендерю документ…</span>}
+              </div>
+              {renderError && (
+                <div className="banner error">
+                  Не удалось отрисовать документ: {renderError}.{' '}
+                  <a href={documentFileUrl(result.tzId)}>Скачать .docx</a>
+                </div>
+              )}
+              <div className="docx-host" ref={previewHostRef} />
+            </div>
           </section>
         )}
       </div>
@@ -836,9 +1081,22 @@ export function ConstructorView({
         </button>
 
         {result && (
-          <div className="card success">
+          <div className="card success side-result">
             <strong>{result.status === 'draft' ? 'Черновик сохранён' : 'ТЗ сформировано'}</strong>
-            <a className="btn" href={result.downloadUrl}>Скачать .docx</a>
+            <span className="muted small">
+              {result.version ? `Версия ${result.version}` : ''}
+            </span>
+            <div className="side-result-actions">
+              <a className="btn small" href={documentFileUrl(result.tzId)} download>.docx</a>
+              <a className="btn small" href={documentFileUrl(result.tzId, 'pdf')} download>.pdf</a>
+              <button
+                type="button"
+                className="btn small ghost"
+                onClick={() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+              >
+                К документу
+              </button>
+            </div>
           </div>
         )}
       </aside>

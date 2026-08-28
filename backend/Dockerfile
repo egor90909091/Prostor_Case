@@ -18,6 +18,14 @@ RUN dotnet publish "src/${PROJECT}/${PROJECT}.csproj" -c Release -o /app --no-re
 FROM mcr.microsoft.com/dotnet/aspnet:8.0.29
 ARG PROJECT
 WORKDIR /app
+
+# Шрифт с кириллицей нужен выгрузке ТЗ в PDF (см. PdfFonts): в PDF нет
+# встроенных шрифтов с русским, а тащить .ttf в репозиторий ради этого — хуже,
+# чем 2 МБ пакета в образе. Ставится в оба сервиса: Dockerfile один на двоих,
+# а лишний слой ничего не ломает.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app .
 ENV ASPNETCORE_URLS=http://+:8080 \
     DOTNET_ENTRY=${PROJECT}.dll

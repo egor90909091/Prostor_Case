@@ -8,17 +8,27 @@ public delegate Task Emit(string eventName, object payload, CancellationToken ct
 /// <summary>
 /// Один ход диалога.
 ///
-/// Свободный текст  -> 1 нестримящийся вызов-роутер (см. TryRouteAsync) и дальше
-///                      либо консультация без обращения к БД, либо ветка поиска:
-///                      1 вызов эмбеддинга + 1 SQL + 1 стримящийся вызов LLM.
-/// Действие (клик)  -> 0 вызовов моделей, только редьюсер и SQL.
+/// Свободный текст  -> 1 структурированный вызов «мозга» (см. Brain.cs): он
+///                      одновременно отвечает пользователю, вытаскивает из
+///                      разговора данные для ТЗ, называет намерение и
+///                      предлагает следующий шаг. Дальше — только код:
+///                      ветка поиска добавляет 1 вызов эмбеддинга + 1 SQL +
+///                      1 стримящийся вызов LLM на формулировку выдачи,
+///                      ветка разговора не добавляет ничего.
+/// Действие (клик)  ->  0 вызовов моделей, только редьюсер и SQL.
 ///
-/// Роутер — единственный tool call во всей системе, без аргументов и без побочных
-/// эффектов: модель решает только КОГДА передать ход детерминированному поиску,
-/// а не ЧТО искать и не ходит в базу сама — идентификатор она по-прежнему не видит
-/// и не может выдумать. Это узкая, точечная вещь, а не agentic tool-calling (см.
-/// docs/architecture.md §5). При ENABLE_ROUTER=false или отказе роутера ход
-/// деградирует на прежнее поведение: любой свободный текст — это поиск.
+/// Ключевое разделение (docs/architecture.md §5): модель решает, ЧТО сказать и
+/// КУДА направить ход, но не ЧТО искать в базе и не какие идентификаторы
+/// использовать — их она не видит. Выбор услуги словами («давай первый») идёт
+/// через номер в последнем показанном списке (ChatState.LastOptions), сроки —
+/// через разбор дат кодом, флаги — по белому списку. Карточки (услуги, сроки,
+/// исполнители, этапы) показываются как предложение поверх разговора и
+/// пропускают гейты кода: нельзя спросить исполнителей без сроков, нельзя
+/// показать одно и то же предложение два хода подряд.
+///
+/// При ENABLE_ROUTER=false, отсутствии ключа или отказе модели ход не падает:
+/// Brain.Fallback принимает то же решение детерминированно — без услуги любой
+/// текст считается поиском, с услугой ответ собирается из состояния заявки.
 /// </summary>
 public sealed class TurnPipeline
 {
@@ -67,14 +77,32 @@ public sealed class TurnPipeline
         missing = state.Missing(),
         productId = state.ProductId,
         productName = state.ProductName,
+        productCategory = state.ProductCategory,
         templateId = state.TemplateId,
         period = state.Period,
         stages = state.Stages.Count,
         executors = state.Executors.Count,
-        tzId = state.TzId
+        executorNames = state.Executors.Select(e => e.Name).ToList(),
+        tzId = state.TzId,
+        // Собранные из разговора поля ТЗ едут в снапшот, чтобы боковая панель
+        // показывала их сразу же: человек видит, что именно услышал ассистент,
+        // и может поправить словом, не дожидаясь конструктора.
+        fields = Brain.FilledFields(state).ToDictionary(f => f.Key, f => f.Value),
+        flags = state.Flags.Where(f => f.Value).Select(f => f.Key).ToList()
     };
 
     // =============================================================== текст
+    /// <summary>
+    /// Свободный текст. Один структурированный вызов «мозга» (см. Brain) даёт
+    /// сразу ответ, намерение, вытащенные из разговора данные для ТЗ, уместное
+    /// предложение следующего шага и подсказки. Дальше работает только код:
+    /// применяет факты, выполняет поиск, показывает карточки.
+    ///
+    /// Порядок внутри хода важен для ощущения диалога: сперва человек видит
+    /// ответ (реплика в его контексте), затем — что записалось, и только потом
+    /// карточки. Карточка никогда не заменяет ответ и никогда не обязательна:
+    /// её можно проигнорировать и продолжить разговор словами.
+    /// </summary>
     private async Task HandleTextAsync(
         Guid sessionId, ChatState state, string text, List<Block> blocks, Emit emit, CancellationToken ct)
     {
@@ -86,115 +114,333 @@ public sealed class TurnPipeline
         }
 
         state.LastQuery = text;
-        state.StepName = state.ProductId is null ? Step.ProductSearch : state.StepName;
 
-        // Свободный текст на шаге заполнения полей трактуем как значение поля,
-        // а не как новый поисковый запрос: пользователь отвечает на вопрос бота.
-        // Это узкий частный случай, роутер его не видит — короткое замыкание
-        // отрабатывает раньше любого вызова LLM.
-        if (state.ProductId is not null && TryFillFreeField(state, text, out var filled))
+        var decision = await ThinkAsync(sessionId, state, text, ct);
+
+        // Факты применяем ДО ответа: если человек назвал сроки словами, ответ
+        // должен звучать уже с учётом записанного периода.
+        var captured = await ApplyFactsAsync(sessionId, state, decision.Facts, blocks, ct);
+
+        var spoke = !string.IsNullOrWhiteSpace(decision.Reply);
+        if (spoke) await EmitTextAsync(decision.Reply, emit, ct);
+
+        // Реплика и текст по результатам поиска приходят дельтами в один и тот
+        // же блок — без разделителя они склеиваются в одно предложение.
+        Task SeparateAsync() => spoke ? emit("delta", new { text = "\n\n" }, ct) : Task.CompletedTask;
+
+        // Первым блоком, а не последним: «что записалось» относится к реплике
+        // пользователя и должно стоять перед карточками, которые эта запись
+        // могла вызвать (названные словами сроки сразу дают список исполнителей).
+        if (captured.Count > 0)
+            blocks.Insert(0, new Block
+            {
+                Type = "captured",
+                Text = "Записал в заявку",
+                Items = new JsonArray(captured.Select(c => (JsonNode)new JsonObject
+                {
+                    ["key"] = c.Key,
+                    ["label"] = Brain.FieldTitle(c.Key),
+                    ["value"] = c.Value
+                }).ToArray())
+            });
+
+        var offer = decision.Offer;
+
+        // Сроки, названные словами, уже привели к списку исполнителей внутри
+        // ApplyFactsAsync — предлагать что-то ещё в этом же ходу незачем.
+        if (captured.Any(c => c.Key == "period")) offer = Offer.None;
+
+        switch (decision.Intent)
         {
-            blocks.Add(Block.TextBlock($"Записал: {filled}."));
-            await AppendDraftAsync(sessionId, state, blocks, ct);
-            return;
+            case Intent.SearchServices:
+                await SeparateAsync();
+                await RunSemanticSearchAsync(sessionId, state, decision.Query ?? text, blocks, emit, ct);
+                offer = Offer.None; // карточки услуг уже показаны — второе предложение в том же ходу лишнее
+                break;
+
+            case Intent.SearchExecutors when state.ProductId is null || !state.Period.IsSet:
+                await SeparateAsync();
+                await RunExecutorSearchAsync(sessionId, state, decision.Query ?? text, blocks, emit, ct);
+                offer = Offer.None;
+                break;
+
+            case Intent.SearchExecutors:
+                // Услуга и сроки известны — «кто это сделает» это уже подбор
+                // исполнителей по заявке с учётом занятости, а не общий поиск.
+                offer = Offer.Executors;
+                break;
+
+            case Intent.PickOption when ResolveOption(state, decision.OptionIndex) is { } picked:
+                await SelectProductAsync(sessionId, state, new TurnAction { Id = picked }, blocks, ct);
+                offer = Offer.None;
+                break;
+
+            case Intent.Restart:
+                ResetState(state);
+                offer = Offer.None;
+                break;
         }
 
-        if (_config.EnableRouter && await TryRouteAsync(sessionId, state, text, blocks, emit, ct))
-            return;
+        await OfferAsync(sessionId, state, offer, blocks, ct);
 
-        // Роутер выключен флагом или не смог принять решение (недоступен, таймаут,
-        // непонятный ответ провайдера) — деградируем на прежнее поведение: любой
-        // свободный текст трактуем как поисковый запрос.
-        await RunSemanticSearchAsync(sessionId, state, text, blocks, emit, ct);
+        if (decision.Suggestions.Count > 0)
+            blocks.Add(new Block
+            {
+                Type = "suggestions",
+                Items = new JsonArray(decision.Suggestions
+                    .Select(s => (JsonNode)new JsonObject { ["text"] = s }).ToArray())
+            });
     }
-
-    private static bool TryFillFreeField(ChatState state, string text, out string label)
-    {
-        label = "";
-        if (string.IsNullOrWhiteSpace(state.Object) && state.StepName is Step.Review or Step.StagesPicked)
-        {
-            state.Object = text;
-            label = $"объект работ — {text}";
-            return true;
-        }
-        return false;
-    }
-
-    // =============================================================== роутер
-    private const string RouterSystemPrompt =
-        "Ты — ассистент подбора нефтесервисных услуг в платформе ПРОСТОР. Разговаривай " +
-        "свободно и по-деловому: отвечай на вопросы о процессе, помогай сформулировать " +
-        "потребность, уточняй детали. Когда пользователь описал вид работ и готов увидеть " +
-        "подходящие услуги — вызови search_services. Когда он ищет подрядчика или " +
-        "компанию («кто может это сделать», «найди исполнителя») — вызови search_executors. " +
-        "Обе функции без аргументов: поисковый запрос система возьмёт из его сообщения сама. " +
-        "Не вызывай ничего, если ещё уточняешь потребность или отвечаешь на общий вопрос. " +
-        "Не придумывай названия услуг, цены, сроки, компании — этого ты не знаешь, факты " +
-        "придут из базы после вызова функции. Отвечай по-русски, 1-3 предложения, без списков.";
 
     /// <summary>
-    /// Один нестримящийся вызов-роутер: модель решает, консультировать пользователя
-    /// текстом или передать ход детерминированному поиску услуг (см. класс-докстринг).
-    ///
-    /// Возвращает true, если ход этим закрыт (консультация или поиск уже выполнены).
-    /// Возвращает false при отказе/ошибке роутера — вызывающий код должен деградировать
-    /// на прежнее поведение сам.
+    /// Один вызов модели на ход. Контекст собирается из базы (карточка услуги,
+    /// этапы, похожие работы, хвост диалога) — модель не ходит в базу сама.
+    /// Любой сбой означает не отказ хода, а детерминированное решение
+    /// <see cref="Brain.Fallback"/>: демо без ключей работает так же.
     /// </summary>
-    private async Task<bool> TryRouteAsync(
-        Guid sessionId, ChatState state, string text, List<Block> blocks, Emit emit, CancellationToken ct)
+    private async Task<BrainDecision> ThinkAsync(
+        Guid sessionId, ChatState state, string text, CancellationToken ct)
     {
-        LlmDecision decision;
+        if (!_config.EnableRouter) return Brain.Fallback(state, text);
+
+        string? transcript = null;
+        try
+        {
+            transcript = await _db.GetDialogueTranscriptAsync(sessionId, ct, maxChars: 4000);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            // Транскрипт — обогащение, а не обязательные данные: без него мозг
+            // работает по состоянию заявки и текущему сообщению.
+            _log.LogWarning(ex, "транскрипт диалога недоступен, ход обрабатывается без истории");
+        }
+
+        ProductCard? card = null;
+        var stages = new List<StageInfo>();
+        var similar = new List<SimilarCalc>();
+        if (state.ProductId is not null)
+        {
+            try
+            {
+                card = await _db.GetProductAsync(state.ProductId, ct);
+                stages = await _db.GetStagesAsync(state.ProductId, _config.TopStages, ct);
+                similar = await _db.GetSimilarCalcsAsync(state.ProductId, 3, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _log.LogWarning(ex, "контекст услуги недоступен, ход обрабатывается без него");
+            }
+        }
+
+        var prompt = Brain.BuildPrompt(
+            state, text, card, stages, similar, transcript, DateOnly.FromDateTime(DateTime.UtcNow));
+
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(_config.LlmTimeoutSeconds));
-            decision = await _llm.DecideAsync(RouterSystemPrompt, BuildRouterUserPrompt(state, text), cts.Token);
+            var raw = await _llm.CompleteJsonAsync(Brain.SystemPrompt, prompt, Brain.Schema, cts.Token);
+            var decision = Brain.Parse(raw);
+            if (decision is not null)
+            {
+                await _db.LogEventAsync(sessionId, "brain",
+                    Json.Write(new { intent = decision.Intent, offer = decision.Offer }), ct);
+                return decision;
+            }
+            _log.LogWarning("мозг диалога вернул неразобранный ответ, ход идёт по детерминированной ветке");
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "роутер недоступен, ход обрабатывается как поиск услуг");
-            return false;
+            _log.LogWarning(ex, "мозг диалога недоступен, ход идёт по детерминированной ветке");
         }
 
-        if (decision.ToolName == RouterTool.SearchExecutors)
-        {
-            await RunExecutorSearchAsync(sessionId, state, text, blocks, emit, ct);
-            return true;
-        }
-
-        if (decision.ToolCalled)
-        {
-            await RunSemanticSearchAsync(sessionId, state, text, blocks, emit, ct);
-            return true;
-        }
-
-        if (string.IsNullOrWhiteSpace(decision.ReplyText))
-        {
-            // Модель ничего не вызвала и ничего не сказала — это отказ роутера,
-            // а не осмысленное «пользователю нечего ответить».
-            _log.LogWarning("роутер вернул пустой ответ без вызова инструмента, обрабатываем как поиск услуг");
-            return false;
-        }
-
-        await EmitTextAsync(decision.ReplyText, emit, ct);
-        return true;
+        return Brain.Fallback(state, text);
     }
 
-    private static string BuildRouterUserPrompt(ChatState state, string text)
+    /// <summary>
+    /// Запись вытащенных из разговора сущностей. Код, а не модель, решает,
+    /// что считать валидным: даты разбираются, флаги берутся по белому списку,
+    /// уже заполненные поля не затираются молча — перезапись только явная
+    /// (модель присылает поле повторно, лишь когда человек его поправил).
+    /// Возвращает то, что реально записалось: это показывается пользователю.
+    /// </summary>
+    private async Task<List<KeyValuePair<string, string>>> ApplyFactsAsync(
+        Guid sessionId, ChatState state, BrainFacts facts, List<Block> blocks, CancellationToken ct)
     {
-        var sb = new StringBuilder();
-        sb.AppendLine($"Сообщение пользователя: {text}");
-        sb.AppendLine();
-        sb.AppendLine("Состояние диалога:");
-        sb.AppendLine(state.ProductId is null
-            ? "- услуга ещё не выбрана"
-            : $"- уже выбрана услуга «{state.ProductName}»");
-        if (state.Period.IsSet)
-            sb.AppendLine($"- сроки согласованы: {state.Period.From} — {state.Period.To}");
-        if (state.Executors.Count > 0)
-            sb.AppendLine($"- исполнителей выбрано: {state.Executors.Count}");
-        return sb.ToString();
+        var captured = new List<KeyValuePair<string, string>>();
+
+        void Set(string key, string? value, Func<string?> get, Action<string> set)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return;
+            var trimmed = value.Trim();
+            if (string.Equals(get(), trimmed, StringComparison.OrdinalIgnoreCase)) return;
+            set(trimmed);
+            captured.Add(new KeyValuePair<string, string>(key, trimmed));
+        }
+
+        Set("object", facts.Object, () => state.Object, v => state.Object = v);
+        Set("purpose", facts.Purpose, () => state.Purpose, v => state.Purpose = v);
+        Set("customer", facts.Customer, () => state.Customer, v => state.Customer = v);
+        Set("perimeter", facts.Perimeter, () => state.Perimeter, v => state.Perimeter = v);
+        Set("sourceData", facts.SourceData, () => state.SourceData, v => state.SourceData = v);
+        Set("documentation", facts.Documentation, () => state.Documentation, v => state.Documentation = v);
+        Set("acceptance", facts.Acceptance, () => state.Acceptance, v => state.Acceptance = v);
+        Set("other", facts.Other, () => state.Other, v => state.Other = v);
+
+        foreach (var flag in facts.Flags)
+        {
+            if (state.Flags.TryGetValue(flag, out var current) && current) continue;
+            state.Flags[flag] = true;
+            captured.Add(new KeyValuePair<string, string>("flag", FlagTitle(flag)));
+        }
+
+        // Сроки словами («с 1 октября на три месяца») — тот же путь, что и
+        // карточка периода: одна и та же проверка дат и один и тот же подбор
+        // исполнителей, иначе диалог и кнопки разошлись бы в поведении.
+        if (DateOnly.TryParse(facts.PeriodFrom, out var from) && DateOnly.TryParse(facts.PeriodTo, out var to))
+        {
+            if (to < from) (from, to) = (to, from);
+            var same = state.Period.From == from.ToString("yyyy-MM-dd") &&
+                       state.Period.To == to.ToString("yyyy-MM-dd");
+            if (!same)
+            {
+                captured.Add(new KeyValuePair<string, string>(
+                    "period", $"{from:yyyy-MM-dd} — {to:yyyy-MM-dd}"));
+                await ApplyPeriodAsync(sessionId, state, from, to, blocks, ct);
+            }
+        }
+
+        if (captured.Count > 0)
+        {
+            await _db.LogEventAsync(sessionId, "facts_captured",
+                Json.Write(new { keys = captured.Select(c => c.Key).ToArray() }), ct);
+        }
+
+        return captured;
     }
+
+    /// <summary>
+    /// Показ карточки следующего шага. Разрешение даёт код: предложение
+    /// модели проходит гейты по заполненным слотам (нельзя спрашивать
+    /// исполнителей без сроков) и защиту от повтора — одно и то же
+    /// предложение два хода подряд не показывается, чтобы диалог не
+    /// превращался в анкету.
+    /// </summary>
+    private async Task OfferAsync(
+        Guid sessionId, ChatState state, string offer, List<Block> blocks, CancellationToken ct)
+    {
+        if (offer is Offer.None || state.ProductId is null) return;
+
+        // Ровно эту карточку уже показывали, и она всё ещё висит в ленте выше —
+        // второй такой же вопрос превращает диалог в анкету. Карточка снова
+        // появится, когда слот изменится или сценарий уйдёт на другой шаг.
+        if (offer == state.LastOffer) return;
+
+        var shown = Offer.None;
+        switch (offer)
+        {
+            case Offer.Period when !state.Period.IsSet:
+                var similar = await _db.GetSimilarCalcsAsync(state.ProductId, 3, ct);
+                blocks.Add(PeriodRequestBlock(state, similar));
+                shown = Offer.Period;
+                break;
+
+            case Offer.Executors when state.Period.IsSet:
+                var executors = await _db.FindExecutorsAsync(
+                    state.ProductId, DateOnly.Parse(state.Period.From!), DateOnly.Parse(state.Period.To!),
+                    allowSubcontract: true, _config.TopExecutors, ct);
+                if (executors.Count > 0)
+                {
+                    blocks.Add(ExecutorListBlock(executors));
+                    shown = Offer.Executors;
+                }
+                break;
+
+            case Offer.Executors:
+                // Исполнителей просят до сроков — без периода занятость не
+                // определена, поэтому сначала период.
+                blocks.Add(PeriodRequestBlock(state, await _db.GetSimilarCalcsAsync(state.ProductId, 3, ct)));
+                shown = Offer.Period;
+                break;
+
+            case Offer.Stages:
+                var stages = await _db.GetStagesAsync(state.ProductId, _config.TopStages, ct);
+                if (stages.Count > 0)
+                {
+                    blocks.Add(StageListBlock(stages, state));
+                    shown = Offer.Stages;
+                }
+                break;
+
+            case Offer.Conditions:
+                blocks.Add(ConditionsBlock(state));
+                shown = Offer.Conditions;
+                break;
+
+            case Offer.Similar:
+                var calcs = await _db.GetSimilarCalcsAsync(state.ProductId, 4, ct);
+                if (calcs.Count > 0)
+                {
+                    blocks.Add(SimilarCalcsBlock(calcs));
+                    shown = Offer.Similar;
+                }
+                break;
+
+            case Offer.Tz:
+                await AppendDraftAsync(sessionId, state, blocks, ct);
+                shown = Offer.Tz;
+                break;
+        }
+
+        // Запоминаем только то, что реально отрисовалось: гейт мог отклонить
+        // предложение модели, и тогда прошлое состояние важнее её пожелания.
+        if (shown != Offer.None) state.LastOffer = shown;
+    }
+
+    /// <summary>Номер варианта из реплики -> идентификатор услуги из последнего списка.</summary>
+    private static string? ResolveOption(ChatState state, int? index)
+    {
+        if (index is null) return null;
+        var i = index.Value - 1;
+        return i >= 0 && i < state.LastOptions.Count ? state.LastOptions[i].Id : null;
+    }
+
+    private static void ResetState(ChatState state)
+    {
+        state.ResetFrom("product");
+        state.ProductId = null;
+        state.ProductName = null;
+        state.ProductCategory = null;
+        state.TemplateId = null;
+        state.TypicalDays = null;
+        state.LastOptions.Clear();
+        state.LastOffer = null;
+        state.StepName = Step.Idle;
+    }
+
+    // Вопросные слова, с которых обычно начинается вопрос ассистенту («а какие
+    // этапы?», «сколько это длится»). Используется детерминированной веткой
+    // (Brain.Fallback), когда модель недоступна: вопрос нельзя записать в поле
+    // «объект работ» — это реплика, а не ответ.
+    private static readonly HashSet<string> QuestionStarts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "что", "как", "какой", "какая", "какое", "какие", "сколько", "почему", "зачем",
+        "когда", "где", "кто", "кого", "кому", "чем", "чему", "какую", "каким",
+        "можно", "нельзя", "подскажи", "расскажи", "покажи", "объясни", "уточни", "а",
+    };
+
+    /// <summary>Похоже ли сообщение на вопрос к ассистенту, а не на ответ боту.</summary>
+    internal static bool LooksLikeQuestion(string text)
+    {
+        var trimmed = text.Trim();
+        if (trimmed.EndsWith('?')) return true;
+        var first = trimmed
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault()?
+            .Trim('?', '!', '.', ',', ';', '«', '»', '"');
+        return !string.IsNullOrEmpty(first) && QuestionStarts.Contains(first!);
+    }
+
 
     /// <summary>
     /// Ответ роутера приходит целиком за один нестримящийся вызов. Нарезаем на части
@@ -296,6 +542,7 @@ public sealed class TurnPipeline
                 (degraded ? "К тому же семантический поиск сейчас недоступен, работал только текстовый. " : "") +
                 "Возможно, подойдёт что-то из этого — но проверьте, а лучше уточните вид работ.",
                 emit, ct);
+            RememberOptions(state, hits);
             blocks.Add(ProductListBlock(hits, tentative: true));
             blocks.Add(ClarifyBlock());
             return;
@@ -303,7 +550,20 @@ public sealed class TurnPipeline
 
         // --- ровно один вызов LLM: данные уже найдены, модель только формулирует
         await StreamAnswerAsync(BuildSearchPrompt(text, hits, degraded), emit, ct);
+        RememberOptions(state, hits);
         blocks.Add(ProductListBlock(hits, tentative: false));
+    }
+
+    /// <summary>
+    /// Список показанных вариантов запоминается в состоянии, чтобы выбор
+    /// работал словами: «давай первый» — это номер в этом списке, а не
+    /// идентификатор, который модель могла бы выдумать.
+    /// </summary>
+    private static void RememberOptions(ChatState state, List<ProductHit> hits)
+    {
+        state.LastOptions = hits
+            .Select(h => new OptionRef { Id = h.ProductId, Title = h.Name })
+            .ToList();
     }
 
     // =============================================================== поиск исполнителей
@@ -403,8 +663,9 @@ public sealed class TurnPipeline
                 await AppendDraftAsync(sessionId, state, blocks, ct);
                 break;
 
-            case "suggest_fields":
-                await SuggestFieldsAsync(state, blocks, ct);
+            case "extract_tz":
+            case "suggest_fields": // legacy-алиас: кнопка из ранее сохранённых ходов
+                await ExtractTzFromDialogueAsync(sessionId, state, blocks, ct);
                 break;
 
             case "set_flag":
@@ -431,6 +692,7 @@ public sealed class TurnPipeline
                 state.ResetFrom("product");
                 state.ProductId = null;
                 state.ProductName = null;
+                state.ProductCategory = null;
                 state.StepName = Step.Idle;
                 blocks.Add(Block.TextBlock("Начинаем заново. Опишите, какие работы нужны."));
                 break;
@@ -462,6 +724,7 @@ public sealed class TurnPipeline
         state.ResetFrom("product");
         state.ProductId = card.ProductId;
         state.ProductName = card.Name;
+        state.ProductCategory = card.Category;
         state.TemplateId = card.TemplateId;
         state.TypicalDays = card.TypicalDays;
         state.StepName = Step.ProductPicked;
@@ -469,14 +732,30 @@ public sealed class TurnPipeline
         await _db.LogEventAsync(sessionId, "product_selected",
             Json.Write(new { productId, name = state.ProductName }), ct);
 
+        // Сроки могли прозвучать в разговоре ещё до выбора услуги («концепт
+        // обустройства, старт в октябре на полгода») — тогда спрашивать их
+        // заново нельзя: сразу подбираем исполнителей на уже названный период.
+        var periodKnown = state.Period.IsSet;
+
         blocks.Add(Block.TextBlock(
             $"Выбрана услуга «{state.ProductName}». " +
             (similar.Count > 0
                 ? $"По ней в системе {similar.Count}+ выполненных работ — ниже похожие. "
                 : "") +
-            "Укажите желаемые сроки — подберу исполнителей, свободных в этот период."));
+            (periodKnown
+                ? $"Сроки уже известны: {state.Period.From} — {state.Period.To}, подбираю исполнителей."
+                : "Укажите желаемые сроки — подберу исполнителей, свободных в этот период.")));
 
-        blocks.Add(PeriodRequestBlock(state, similar));
+        if (periodKnown)
+        {
+            await ApplyPeriodAsync(sessionId, state,
+                DateOnly.Parse(state.Period.From!), DateOnly.Parse(state.Period.To!), blocks, ct);
+        }
+        else
+        {
+            blocks.Add(PeriodRequestBlock(state, similar));
+            state.LastOffer = Offer.Period;
+        }
         if (similar.Count > 0) blocks.Add(SimilarCalcsBlock(similar));
         if (related.Count > 0) blocks.Add(RelatedBlock(related));
         blocks.Add(RecommendationsBlock(state, stages, operations));
@@ -484,21 +763,29 @@ public sealed class TurnPipeline
         // Явная кнопка, а не тихий вызов LLM здесь же: SelectProductAsync не
         // получает emit (блоки флашатся только после возврата из
         // HandleActionAsync), поэтому синхронный вызов CompleteJsonAsync
-        // держал бы период-карточку в подвешенном состоянии до 45 секунд
-        // при недоступности LLM. suggest_fields — отдельное действие со
-        // своим ходом и таймаутом.
-        if (!string.IsNullOrWhiteSpace(state.LastQuery))
-        {
-            blocks.Add(new Block
-            {
-                Type = "actions",
-                Items = new JsonArray
-                {
-                    new JsonObject { ["action"] = "suggest_fields", ["title"] = "Предложить поля ТЗ по описанию" }
-                }
-            });
-        }
+        // держал бы период-карточку в подвешенном состоянии до 45 секунд при
+        // недоступности LLM. extract_tz — отдельное действие со своим ходом,
+        // таймаутом и стримингом статуса.
+        blocks.Add(ExtractTzButton());
     }
+
+    /// <summary>
+    /// Кнопка ручного запуска экстракции полей ТЗ из всего диалога. Показываем
+    /// сразу после выбора услуги и потом на каждом пересчёте черновика — юзер
+    /// сам решает, когда «уже наговорил достаточно, разложи по ТЗ».
+    /// </summary>
+    private static Block ExtractTzButton() => new()
+    {
+        Type = "actions",
+        Items = new JsonArray
+        {
+            new JsonObject
+            {
+                ["action"] = "extract_tz",
+                ["title"] = "Генерация технического задания на основании диалога"
+            }
+        }
+    };
 
     private async Task SetPeriodAsync(
         Guid sessionId, ChatState state, TurnAction action, List<Block> blocks, CancellationToken ct)
@@ -509,16 +796,27 @@ public sealed class TurnPipeline
             return;
         }
         if (to < from) (from, to) = (to, from);
+        await ApplyPeriodAsync(sessionId, state, from, to, blocks, ct);
+    }
 
+    /// <summary>
+    /// Единственное место, где записывается период: и карточка, и сроки,
+    /// названные словами в диалоге, приходят сюда. Иначе поведение кнопок и
+    /// разговора разъехалось бы — например, подбор исполнителей запускался бы
+    /// только по клику.
+    /// </summary>
+    private async Task ApplyPeriodAsync(
+        Guid sessionId, ChatState state, DateOnly from, DateOnly to, List<Block> blocks, CancellationToken ct)
+    {
         state.ResetFrom("period");
         state.Period = new Period { From = from.ToString("yyyy-MM-dd"), To = to.ToString("yyyy-MM-dd") };
         state.StepName = Step.PeriodSet;
 
-        if (state.ProductId is null)
-        {
-            blocks.Add(Block.TextBlock("Сначала выберите услугу."));
-            return;
-        }
+        // Услуга ещё не выбрана — период просто записан как факт заявки:
+        // подбирать исполнителей не по чему, но и одёргивать человека
+        // («сначала выберите услугу») незачем, он назвал сроки по своей воле.
+        // Список исполнителей появится сразу после выбора услуги.
+        if (state.ProductId is null) return;
 
         var executors = await _db.FindExecutorsAsync(
             state.ProductId, from, to, allowSubcontract: true, _config.TopExecutors, ct);
@@ -548,7 +846,12 @@ public sealed class TurnPipeline
                     : $"Нашёл {executors.Count} исполнителей на период {state.Period.From} — {state.Period.To}. " +
                       "Список отсортирован по опыту, доступности и рейтингу." + warning));
 
-        if (executors.Count > 0) blocks.Add(ExecutorListBlock(executors));
+        if (executors.Count > 0)
+        {
+            blocks.Add(ExecutorListBlock(executors));
+            // Список уже показан — OfferAsync в этом же ходу его не продублирует.
+            state.LastOffer = Offer.Executors;
+        }
     }
 
     private async Task SelectExecutorsAsync(
@@ -626,48 +929,89 @@ public sealed class TurnPipeline
         }
     }
 
-    // Ключи те же, что и у set_field/ApplyField (кроме customer/object/other —
-    // их не извлекаем: объект работ уже покрыт TryFillFreeField, заказчик и
-    // «прочее» слишком открытые, чтобы LLM не начала додумывать).
-    private const string SuggestFieldsSystemPrompt = """
-        Ты помогаешь извлечь структурированные данные из описания потребности
-        заказчика нефтесервисных услуг. Из текста пользователя извлеки, только
-        если это явно следует из него (не додумывай и не обобщай сверх сказанного):
-        - purpose — цель работ
-        - perimeter — периметр/границы работ
-        - source_data — исходные данные, которые уже есть у заказчика
-        - documentation — какая итоговая документация нужна на выходе
-        - acceptance — критерии приёмки результата
+    private const string ExtractTzSystemPromptHead =
+        "Ты извлекаешь данные для технического задания (ТЗ) на нефтесервисные и " +
+        "инжиниринговые услуги из переписки заказчика с ассистентом подбора. Тебе " +
+        "дан транскрипт ВСЕГО диалога и список полей ТЗ с пояснениями. Разложи по " +
+        "полям только то, что заказчик реально сказал или подтвердил по ходу " +
+        "диалога — учитывай все его реплики, а не только последнюю. Ничего не " +
+        "придумывай, не обобщай и не подставляй «стандартные» формулировки. Если " +
+        "по полю в диалоге нет явных данных — не включай его ключ в ответ.\n\n" +
+        "Поля ТЗ (ключ — назначение):";
 
-        Если что-то из этого текст не содержит — не включай такой ключ в ответ
-        вообще (не выдумывай общие фразы вместо этого).
+    private const string ExtractTzSystemPromptTail =
+        "\nОтветь СТРОГО одним JSON-объектом: ключи — идентификаторы полей выше " +
+        "(только те, для которых нашлись данные), значения — короткие деловые " +
+        "формулировки на русском языке. Без markdown, без пояснений.";
 
-        Ответь СТРОГО одним JSON-объектом с этими ключами (только теми, что
-        нашёл), значения — короткие фразы на русском языке, без вступлений.
-        """;
-
-    private static readonly Dictionary<string, string> SuggestableFieldLabels = new()
+    private static string BuildExtractTzSystemPrompt(IReadOnlyList<TzTextField> fields)
     {
-        ["purpose"] = "Цель работ",
-        ["perimeter"] = "Периметр работ",
-        ["source_data"] = "Исходные данные",
-        ["documentation"] = "Итоговая документация",
-        ["acceptance"] = "Критерии приёмки",
-    };
+        var sb = new StringBuilder(ExtractTzSystemPromptHead);
+        sb.AppendLine();
+        foreach (var field in fields)
+        {
+            sb.Append("- ").Append(field.Key).Append(" — ").Append(field.Title);
+            if (!string.IsNullOrWhiteSpace(field.Hint)) sb.Append(" (").Append(field.Hint).Append(')');
+            sb.AppendLine();
+        }
+        sb.Append(ExtractTzSystemPromptTail);
+        return sb.ToString();
+    }
 
     /// <summary>
-    /// Извлечение черновика текстовых полей ТЗ из последнего свободного
-    /// описания потребности (state.LastQuery). Явное действие пользователя —
-    /// не срабатывает молча при выборе услуги (см. комментарий в
-    /// SelectProductAsync). Ничего не применяется в ChatState автоматически:
-    /// каждое поле пользователь принимает отдельно через обычный set_field,
-    /// уже на фронте (Blocks.tsx, SuggestedFields).
+    /// Схема ответа: объект со строковым (или null) значением на каждый ключ
+    /// поля. required + additionalProperties:false — чтобы строгий json_schema
+    /// на поддерживающих провайдерах не отвергался; null-значения потом
+    /// отсеиваются как «поле не найдено».
     /// </summary>
-    private async Task SuggestFieldsAsync(ChatState state, List<Block> blocks, CancellationToken ct)
+    private static JsonReplySchema BuildExtractTzSchema(IReadOnlyList<TzTextField> fields)
     {
-        if (string.IsNullOrWhiteSpace(state.LastQuery))
+        var properties = new JsonObject();
+        var required = new JsonArray();
+        foreach (var field in fields)
         {
-            blocks.Add(Block.TextBlock("Пока нечего предложить — опишите потребность текстом."));
+            properties[field.Key] = new JsonObject
+            {
+                ["type"] = new JsonArray("string", "null"),
+                ["description"] = field.Title
+            };
+            required.Add((JsonNode)field.Key);
+        }
+
+        return new JsonReplySchema("tz_fields", new JsonObject
+        {
+            ["type"] = "object",
+            ["properties"] = properties,
+            ["required"] = required,
+            ["additionalProperties"] = false
+        });
+    }
+
+    /// <summary>
+    /// Ручная экстракция текстовых полей ТЗ из всего диалога (кнопка
+    /// «Генерация технического задания на основании диалога»). Явное действие
+    /// пользователя со своим ходом и таймаутом. Список полей и подсказки
+    /// берутся из шаблона конструктора (TzClient.GetTextFieldsAsync) — модель
+    /// сама раскладывает переписку по реальным полям. Ничего не применяется в
+    /// ChatState автоматически: каждое поле пользователь принимает отдельно
+    /// обычным set_field на фронте (Blocks.tsx, SuggestedFields).
+    /// </summary>
+    private async Task ExtractTzFromDialogueAsync(
+        Guid sessionId, ChatState state, List<Block> blocks, CancellationToken ct)
+    {
+        var transcript = await _db.GetDialogueTranscriptAsync(sessionId, ct);
+        if (string.IsNullOrWhiteSpace(transcript))
+        {
+            blocks.Add(Block.TextBlock(
+                "Диалог пока пустой — опишите потребность, тогда будет что разложить по ТЗ."));
+            return;
+        }
+
+        var fields = await _tz.GetTextFieldsAsync(state.TemplateId, ct);
+        if (fields.Count == 0)
+        {
+            blocks.Add(Block.TextBlock(
+                "Не удалось получить список полей ТЗ из конструктора — заполните их вручную."));
             return;
         }
 
@@ -676,36 +1020,49 @@ public sealed class TurnPipeline
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(_config.LlmTimeoutSeconds));
-            result = await _llm.CompleteJsonAsync(SuggestFieldsSystemPrompt, state.LastQuery, cts.Token);
+            result = await _llm.CompleteJsonAsync(
+                BuildExtractTzSystemPrompt(fields), transcript, BuildExtractTzSchema(fields), cts.Token);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {
-            _log.LogWarning(ex, "извлечение полей ТЗ недоступно");
-            blocks.Add(Block.TextBlock("Не удалось предложить поля — заполните их вручную в конструкторе."));
+            _log.LogWarning(ex, "экстракция полей ТЗ из диалога недоступна");
+            blocks.Add(Block.TextBlock(
+                "Не удалось разобрать диалог — заполните поля ТЗ вручную в конструкторе."));
             return;
         }
 
         var items = new JsonArray();
         if (result is not null)
         {
-            foreach (var (key, label) in SuggestableFieldLabels)
+            foreach (var field in fields)
             {
-                var value = result[key] is JsonValue v && v.TryGetValue<string>(out var s) ? s.Trim() : null;
+                var value = result[field.Key] is JsonValue v && v.TryGetValue<string>(out var s)
+                    ? s.Trim()
+                    : null;
                 if (string.IsNullOrWhiteSpace(value)) continue;
-                items.Add(new JsonObject { ["key"] = key, ["label"] = label, ["value"] = value });
+                items.Add(new JsonObject
+                {
+                    ["key"] = field.Key,
+                    ["label"] = field.Title,
+                    ["value"] = value
+                });
             }
         }
 
         if (items.Count == 0)
         {
-            blocks.Add(Block.TextBlock("По описанию не нашёл, чем заполнить поля автоматически — впишите вручную."));
+            blocks.Add(Block.TextBlock(
+                "В диалоге не нашлось данных, которые можно разложить по полям ТЗ — заполните вручную в конструкторе."));
             return;
         }
+
+        await _db.LogEventAsync(sessionId, "tz_extracted",
+            Json.Write(new { fields = items.Count }), ct);
 
         blocks.Add(new Block
         {
             Type = "suggested_fields",
-            Text = "Кажется, вот что можно заполнить по вашему описанию — проверьте и примените",
+            Text = "Вот что удалось собрать из диалога для ТЗ — проверьте каждое поле и примените нужные",
             Items = items
         });
     }
@@ -754,6 +1111,11 @@ public sealed class TurnPipeline
             Type = "actions",
             Items = new JsonArray
             {
+                new JsonObject
+                {
+                    ["action"] = "extract_tz",
+                    ["title"] = "Генерация технического задания на основании диалога"
+                },
                 new JsonObject { ["action"] = "open_constructor", ["title"] = "Сформировать ТЗ в конструкторе" }
             }
         });

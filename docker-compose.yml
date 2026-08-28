@@ -59,6 +59,11 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      # true -> JSON-вызовы (экстракция полей ТЗ, ревью) уходят со строгой
+      # response_format json_schema. По умолчанию false: DeepSeek на дефолтном
+      # эндпоинте строгую схему не держит, json_object держит. Битый JSON всё
+      # равно чинится повторным вызовом независимо от флага.
+      LLM_STRUCTURED_OUTPUTS: ${LLM_STRUCTURED_OUTPUTS:-false}
       # Эмбеддинги: отдельный endpoint, без ключа по умолчанию (локальный Ollama
       # с bge-m3, поднятый на хосте вне docker compose). Пусто -> детерминированная
       # заглушка (hashing trick, см. StubEmbedder в Prostor.Chat).

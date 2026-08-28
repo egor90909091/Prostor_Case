@@ -12,4 +12,9 @@
     <PackageReference Include="Npgsql" Version="8.0.5" />
   </ItemGroup>
 
+  <!-- Для xUnit-тестов чистой логики пайплайна (TryFillFreeField, промпты) -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Prostor.Chat.Tests" />
+  </ItemGroup>
+
 </Project>

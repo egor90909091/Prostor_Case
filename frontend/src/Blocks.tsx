@@ -1,19 +1,44 @@
 import { useState } from 'react'
 import type { Block, BlockItem, TurnAction } from './api'
+import { documentFileUrl } from './api'
 
 interface Props {
   block: Block
   disabled: boolean
   onAction: (action: TurnAction) => void
   onOpenConstructor: () => void
+  // Подсказка-чип отправляется как обычная реплика пользователя: это то же
+  // самое, что он мог бы напечатать сам, поэтому отдельного действия у неё нет.
+  onSuggest?: (text: string) => void
+  // id услуги, выбранной сейчас в заявке: карточка с этим id в истории
+  // подсвечивается как выбранная, чтобы выбор было видно в любом месте диалога.
+  selectedProductId?: string
 }
 
-export function BlockView({ block, disabled, onAction, onOpenConstructor }: Props) {
+export function BlockView({
+  block,
+  disabled,
+  onAction,
+  onOpenConstructor,
+  onSuggest,
+  selectedProductId,
+}: Props) {
   switch (block.type) {
     case 'text':
       return <p className="msg-text">{block.text}</p>
+    case 'captured':
+      return <Captured block={block} />
+    case 'suggestions':
+      return <Suggestions block={block} disabled={disabled} onSuggest={onSuggest} />
     case 'product_list':
-      return <ProductList block={block} disabled={disabled} onAction={onAction} />
+      return (
+        <ProductList
+          block={block}
+          disabled={disabled}
+          onAction={onAction}
+          selectedProductId={selectedProductId}
+        />
+      )
     case 'company_list':
       return <CompanyList block={block} />
     case 'clarify':
@@ -60,9 +85,16 @@ export function BlockView({ block, disabled, onAction, onOpenConstructor }: Prop
         <div className="card success">
           <strong>{block.text}</strong>
           {block.meta?.tzId && (
-            <a className="btn" href={`/api/v1/tz/documents/${block.meta.tzId}/file`}>
-              Скачать .docx
-            </a>
+            // Оба формата — как в конструкторе и «Мои заявки»: один документ,
+            // одинаковый набор действий, где бы он ни показывался.
+            <div className="doc-chip-actions">
+              <a className="btn" href={documentFileUrl(String(block.meta.tzId))} download>
+                Скачать .docx
+              </a>
+              <a className="btn" href={documentFileUrl(String(block.meta.tzId), 'pdf')} download>
+                Скачать .pdf
+              </a>
+            </div>
           )}
         </div>
       )
@@ -71,6 +103,46 @@ export function BlockView({ block, disabled, onAction, onOpenConstructor }: Prop
     default:
       return <p className="msg-text">{block.text ?? block.type}</p>
   }
+}
+
+// Что ассистент услышал в реплике и записал в заявку. Отдельная строка, а не
+// текст ответа: человек видит состав данных ТЗ по мере разговора и замечает,
+// если его поняли не так.
+function Captured({ block }: { block: Block }) {
+  return (
+    <div className="captured">
+      <span className="captured-label">{block.text ?? 'Записал в заявку'}</span>
+      {(block.items ?? []).map((item, i) => (
+        <span className="tag" key={i}>
+          {item.label}: {item.value}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+// Подсказки следующей реплики. Кнопки не обязывают: их можно игнорировать и
+// продолжать печатать своими словами — это по-прежнему один и тот же диалог.
+function Suggestions({
+  block,
+  disabled,
+  onSuggest,
+}: {
+  block: Block
+  disabled: boolean
+  onSuggest?: (text: string) => void
+}) {
+  const items = (block.items ?? []).filter((item) => item.text)
+  if (items.length === 0 || !onSuggest) return null
+  return (
+    <div className="suggestions">
+      {items.map((item, i) => (
+        <button key={i} className="chip" disabled={disabled} onClick={() => onSuggest(item.text)}>
+          {item.text}
+        </button>
+      ))}
+    </div>
+  )
 }
 
 function describeAction(block: Block): string {
@@ -82,15 +154,21 @@ function describeAction(block: Block): string {
     select_operations: 'выбраны операции',
     set_flag: 'изменено условие работ',
     set_field: 'заполнено поле',
-    suggest_fields: 'запрошены предложения по полям',
-    tz_created: 'сформировано ТЗ',
+    extract_tz: 'запрошена сборка полей ТЗ из диалога',
+    suggest_fields: 'запрошена сборка полей ТЗ из диалога',
+    tz_created: 'ТЗ сформировано',
     reset: 'начать заново',
   }
   return map[block.text ?? ''] ?? (block.text ?? '')
 }
 
 // ------------------------------------------------------------------ услуги
-function ProductList({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor'>) {
+function ProductList({
+  block,
+  disabled,
+  onAction,
+  selectedProductId,
+}: Omit<Props, 'onOpenConstructor'>) {
   // tentative приходит с сервера, когда выдача не прошла проверку уверенности
   // (TurnPipeline.Assess). Подавать такие результаты как находку нельзя —
   // именно так пять нерелевантных услуг выглядели уверенным ответом.
@@ -103,35 +181,52 @@ function ProductList({ block, disabled, onAction }: Omit<Props, 'onOpenConstruct
           перед выбором.
         </div>
       )}
-      {(block.items ?? []).map((item: BlockItem) => (
-        <div className={`card${item.weak ? ' weak' : ''}`} key={item.id}>
-          <div className="card-head">
-            <span className="rank">{item.rank}</span>
-            <div>
-              <div className="card-title">{item.title}</div>
-              <div className="card-sub">{item.category}</div>
+      {(block.items ?? []).map((item: BlockItem) => {
+        // Карточка, совпадающая с выбранным productId, помечается в любом
+        // месте истории — в том числе надолго после выбора и после перезагрузки
+        // страницы (state восстанавливается из GET /sessions/{id}).
+        const selected = !!selectedProductId && selectedProductId === item.id
+        return (
+          <div className={`card${item.weak ? ' weak' : ''}${selected ? ' selected' : ''}`} key={item.id}>
+            <div className="card-head">
+              <span className="rank">{item.rank}</span>
+              <div>
+                <div className="card-title">
+                  {item.title}
+                  {selected && <span className="badge ok selected-badge">Выбрана</span>}
+                </div>
+                <div className="card-sub">{item.category}</div>
+              </div>
+              {/* три знака вместо двух: на двух вся выдача выглядела как один
+                  и тот же балл, хотя различия были — и это читалось как поломка */}
+              <span className="score" title="итоговая релевантность">
+                {Number(item.score).toFixed(3)}
+              </span>
             </div>
-            {/* три знака вместо двух: на двух вся выдача выглядела как один
-                и тот же балл, хотя различия были — и это читалось как поломка */}
-            <span className="score" title="итоговая релевантность">
-              {Number(item.score).toFixed(3)}
-            </span>
+            {item.snippet && <div className="snippet">{item.snippet}</div>}
+            <div className="tags">
+              {(item.reasons ?? []).map((r: string, i: number) => (
+                <span className={`tag${i === 0 && item.weak ? ' warn' : ''}`} key={i}>{r}</span>
+              ))}
+            </div>
+            {selected ? (
+              // Кнопка остаётся на месте, но уже не кликается: перезапуск
+              // сценария — это «Начать заново» или новый поисковый запрос.
+              <button className="btn" disabled>
+                Выбрано
+              </button>
+            ) : (
+              <button
+                className={`btn ${tentative ? '' : 'primary'}`}
+                disabled={disabled}
+                onClick={() => onAction({ type: 'select_product', id: item.id })}
+              >
+                Выбрать услугу
+              </button>
+            )}
           </div>
-          {item.snippet && <div className="snippet">{item.snippet}</div>}
-          <div className="tags">
-            {(item.reasons ?? []).map((r: string, i: number) => (
-              <span className={`tag${i === 0 && item.weak ? ' warn' : ''}`} key={i}>{r}</span>
-            ))}
-          </div>
-          <button
-            className={`btn ${tentative ? '' : 'primary'}`}
-            disabled={disabled}
-            onClick={() => onAction({ type: 'select_product', id: item.id })}
-          >
-            Выбрать услугу
-          </button>
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
@@ -529,6 +624,22 @@ export function DocxIcon() {
       />
       <path d="M11.5 2.5V7H16" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
       <path d="M6.7 10.5 7.7 14.5 8.9 11 10.1 14.5 11.1 10.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+export function PdfIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path
+        d="M5 2.5h6.5L16 7v10.5H5a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5Z"
+        stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round"
+      />
+      <path d="M11.5 2.5V7H16" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+      <path
+        d="M6.8 14.5v-4h1.1a1.1 1.1 0 0 1 0 2.2H6.8M10.8 14.5v-4h.9a1.4 1.4 0 0 1 1.4 1.4v1.2a1.4 1.4 0 0 1-1.4 1.4h-.9Z"
+        stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"
+      />
     </svg>
   )
 }

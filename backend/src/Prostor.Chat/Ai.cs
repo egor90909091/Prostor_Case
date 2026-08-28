@@ -214,25 +214,76 @@ public static class VectorLiteral
     }
 }
 
-/// <summary>Инструменты, доступные роутеру. Больше их нет и не появляется динамически.</summary>
-public static class RouterTool
-{
-    /// <summary>Пользователь описал вид работ — показать услуги каталога.</summary>
-    public const string SearchServices = "search_services";
-
-    /// <summary>Пользователь ищет подрядчика — показать компании по способностям.</summary>
-    public const string SearchExecutors = "search_executors";
-}
-
 /// <summary>
-/// Результат вызова-роутера. Либо заполнен <see cref="ToolName"/> — модель
-/// попросила передать управление одному из двух детерминированных поисков
-/// (оба без аргументов и без побочных эффектов), либо заполнен
-/// <see cref="ReplyText"/> — это и есть ответ пользователю, без обращения к БД.
+/// Схема ожидаемого JSON-ответа: имя + тело JSON Schema. Передаётся модели
+/// двумя путями сразу — как <c>response_format: json_schema</c> (если провайдер
+/// это держит и включён <c>LLM_STRUCTURED_OUTPUTS</c>) и всегда текстом внутри
+/// системной подсказки вызывающей стороны, — чтобы форма соблюдалась и на
+/// json_object-only провайдере вроде DeepSeek.
 /// </summary>
-public sealed record LlmDecision(string? ReplyText, string? ToolName)
+public sealed record JsonReplySchema(string Name, JsonObject Schema);
+
+/// <summary>Разбор JSON-ответа модели, устойчивый к типовому мусору вокруг.</summary>
+public static class JsonReply
 {
-    public bool ToolCalled => ToolName is not null;
+    /// <summary>
+    /// Достаёт первый сбалансированный JSON-объект из ответа модели, терпя
+    /// markdown-фенсы (```json … ```) и текст до/после. Возвращает null, если
+    /// объекта нет вовсе.
+    /// </summary>
+    public static JsonObject? Extract(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return null;
+        var text = content.Trim();
+
+        if (text.StartsWith("```", StringComparison.Ordinal))
+        {
+            var firstNewLine = text.IndexOf('\n');
+            if (firstNewLine >= 0) text = text[(firstNewLine + 1)..];
+            var closingFence = text.LastIndexOf("```", StringComparison.Ordinal);
+            if (closingFence >= 0) text = text[..closingFence];
+            text = text.Trim();
+        }
+
+        if (TryParse(text, out var direct)) return direct;
+
+        var start = text.IndexOf('{');
+        if (start < 0) return null;
+
+        var depth = 0;
+        var inString = false;
+        var escaped = false;
+        for (var i = start; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (inString)
+            {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') inString = true;
+            else if (c == '{') depth++;
+            else if (c == '}' && --depth == 0)
+                return TryParse(text[start..(i + 1)], out var slice) ? slice : null;
+        }
+        return null;
+    }
+
+    private static bool TryParse(string candidate, out JsonObject? result)
+    {
+        result = null;
+        try
+        {
+            result = JsonNode.Parse(candidate) as JsonObject;
+            return result is not null;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
 }
 
 public interface ILlm
@@ -241,26 +292,29 @@ public interface ILlm
     IAsyncEnumerable<string> StreamAsync(string system, string user, CancellationToken ct);
 
     /// <summary>
-    /// Один нестримящийся вызов-роутер на свободный текст: консультировать пользователя
-    /// текстом, показать услуги каталога или показать исполнителей. Модель не выбирает,
-    /// ЧТО искать, — у инструментов нет аргументов, поисковым запросом остаётся исходный
-    /// текст пользователя. Это не agentic tool-calling из раздела 5 architecture.md:
-    /// инструментов ровно два, оба без параметров и без побочных эффектов, они лишь
-    /// переключают, какая из уже существующих детерминированных веток хода выполнится.
+    /// Один нестримящийся текстовый вызов: ответ модели приходит целиком за один
+    /// HTTP round-trip (используется консультацией по выбранной услуге — там
+    /// важнее дождаться готового ответа, чем получить первые токены). Реализация
+    /// OpenAiLlm делает это честным stream=false; заглушка без ключа просто
+    /// отдаёт текст после маркера ОТВЕТ_ЗАГЛУШКИ, как и StreamAsync.
     /// </summary>
-    Task<LlmDecision> DecideAsync(string system, string user, CancellationToken ct);
+    Task<string?> CompleteAsync(string system, string user, CancellationToken ct);
 
     /// <summary>
     /// Один нестримящийся вызов в JSON-mode: структурированное извлечение
-    /// (подсказки для полей черновика) или ревью текста. Как и DecideAsync/
-    /// StreamAsync, ошибки (сеть, не-2xx, невалидный JSON в ответе) не
-    /// перехватываются здесь — это дело вызывающей стороны (таймаут через
-    /// linked CTS + try/catch, тем же паттерном, что уже применяется вокруг
-    /// DecideAsync в TryRouteAsync). Возвращает null, только если модель
-    /// ответила пустым содержимым, — не значит «недоступен», это решает
-    /// вызывающая сторона по перехваченному исключению.
+    /// (поля ТЗ из диалога) или ревью текста. <paramref name="schema"/> —
+    /// ожидаемая форма ответа: уходит в response_format json_schema, если
+    /// провайдер это держит и включён LLM_STRUCTURED_OUTPUTS, иначе вызов идёт
+    /// в json_object (форму задаёт system-подсказка вызывающей стороны).
+    ///
+    /// Сетевые/не-2xx ошибки не перехватываются здесь — это дело вызывающей
+    /// стороны (linked CTS + try/catch, как вокруг вызова в TurnPipeline.ThinkAsync).
+    /// А вот невалидный JSON в ответе обрабатывается: реализация делает один
+    /// повторный вызов с показом модели её же битого ответа. Возвращает null,
+    /// если даже после починки объект получить не удалось (или ответ пуст).
     /// </summary>
-    Task<JsonObject?> CompleteJsonAsync(string system, string user, CancellationToken ct);
+    Task<JsonObject?> CompleteJsonAsync(
+        string system, string user, JsonReplySchema? schema, CancellationToken ct);
 
     string Kind { get; }
 }
@@ -299,58 +353,31 @@ public sealed class StubLlm : ILlm
     }
 
     /// <summary>
-    /// Без реальной модели роутер не умеет вести диалог — воспроизводим правило,
-    /// которое действовало до его появления: любой свободный текст (кроме отдельно
-    /// перехватываемого TryFillFreeField в Pipeline) считается поиском услуг.
-    /// Демо без LLM_API_KEY ведёт себя так же, как до этой фичи, независимо от
-    /// значения ENABLE_ROUTER.
+    /// Пустой, но не null объект: «отработал, предложить нечего» — не путать с
+    /// недоступностью. Ход диалога распознаёт такой ответ как «модели нет» и
+    /// уходит в Brain.Fallback, а экстракция полей ТЗ — как «данных не нашлось».
     /// </summary>
-    public Task<LlmDecision> DecideAsync(string system, string user, CancellationToken ct) =>
-        Task.FromResult(new LlmDecision(ReplyText: null, ToolName: RouterTool.SearchServices));
-
-    /// <summary>Пустой, но не null объект: «отработал, предложить нечего» — не путать с недоступностью.</summary>
-    public Task<JsonObject?> CompleteJsonAsync(string system, string user, CancellationToken ct) =>
+    public Task<JsonObject?> CompleteJsonAsync(
+        string system, string user, JsonReplySchema? schema, CancellationToken ct) =>
         Task.FromResult<JsonObject?>(new JsonObject());
+
+    /// <summary>
+    /// Без ключа связного ответа взять неоткуда: возвращаем null, вызывающая
+    /// ветка подставит свой детерминированный текст (Brain.Fallback).
+    /// </summary>
+    public Task<string?> CompleteAsync(string system, string user, CancellationToken ct) =>
+        Task.FromResult<string?>(null);
 }
 
 public sealed class OpenAiLlm : ILlm
 {
-    // Все инструменты, которые вообще может увидеть модель. Оба без аргументов:
-    // поисковым запросом остаётся исходный текст пользователя, а не то, что
-    // модель могла бы пересказать своими словами.
-    private static readonly JsonArray RouterTools = new()
-    {
-        Tool(RouterTool.SearchServices,
-            "Вызови, когда пользователь описал ВИД РАБОТ и готов увидеть подходящие услуги " +
-            "из каталога ПРОСТОР. Не вызывай, если ещё уточняешь потребность, отвечаешь на " +
-            "общий вопрос или пользователь просит изменить уже выбранные параметры."),
-        Tool(RouterTool.SearchExecutors,
-            "Вызови, когда пользователь ищет ИСПОЛНИТЕЛЯ, подрядчика или компанию: «кто может " +
-            "это сделать», «найди подрядчика», «кто пробурит скважину». Отличай от " +
-            "search_services: там пользователь ищет саму услугу, здесь — того, кто её выполнит.")
-    };
-
-    private static JsonObject Tool(string name, string description) => new()
-    {
-        ["type"] = "function",
-        ["function"] = new JsonObject
-        {
-            ["name"] = name,
-            ["description"] = description,
-            ["parameters"] = new JsonObject
-            {
-                ["type"] = "object",
-                ["properties"] = new JsonObject(),
-                ["additionalProperties"] = false
-            }
-        }
-    };
-
-    private static readonly HashSet<string> KnownTools =
-        new(StringComparer.Ordinal) { RouterTool.SearchServices, RouterTool.SearchExecutors };
-
     private readonly HttpClient _http;
     private readonly AppConfig _config;
+
+    // Взводится один раз, если провайдер отверг response_format json_schema:
+    // дальше в этом процессе такие вызовы сразу идут в json_object, без
+    // заведомо провального первого хода.
+    private volatile bool _schemaUnsupported;
 
     public OpenAiLlm(HttpClient http, AppConfig config)
     {
@@ -365,13 +392,25 @@ public sealed class OpenAiLlm : ILlm
     public string Kind => "openai-compatible";
 
     /// <summary>
-    /// Нестримящийся вызов-роутер: одно решение за один HTTP round-trip, без разбора
-    /// потоковых SSE-кадров с фрагментами tool_calls[].function.arguments — этот путь
-    /// сознательно не совмещает streaming и tool calling, чтобы не зависеть от того,
-    /// насколько аккуратно конкретный OpenAI-совместимый провайдер поддерживает их
-    /// комбинацию (у DeepSeek на момент написания она не задокументирована).
+    /// Один нестримящийся round-trip с response_format: на нём держится и ход
+    /// диалога (Brain.Schema), и извлечение полей ТЗ, и ревью текста.
+    ///
+    /// Три уровня устойчивости: (1) при LLM_STRUCTURED_OUTPUTS шлём строгую
+    /// json_schema, при 400 с жалобой на response_format прозрачно откатываемся
+    /// на json_object; (2) ответ разбираем терпимо (JsonReply.Extract снимает
+    /// markdown-фенсы и текст вокруг); (3) если объект всё равно не собрался —
+    /// один повторный вызов, показывающий модели её же битый ответ.
     /// </summary>
-    public async Task<LlmDecision> DecideAsync(string system, string user, CancellationToken ct)
+    public Task<JsonObject?> CompleteJsonAsync(
+        string system, string user, JsonReplySchema? schema, CancellationToken ct) =>
+        CompleteStructuredAsync(system, user, schema, ct);
+
+    /// <summary>
+    /// Нестримящийся текстовый вызов: один HTTP round-trip со stream=false и
+    /// без response_format — модели не нужно «запираться» в JSON, она просто
+    /// отвечает пользователю. Разбор choices[0].message.content общий с JSON-веткой.
+    /// </summary>
+    public async Task<string?> CompleteAsync(string system, string user, CancellationToken ct)
     {
         var payload = new
         {
@@ -382,9 +421,7 @@ public sealed class OpenAiLlm : ILlm
             {
                 new { role = "system", content = system },
                 new { role = "user", content = user }
-            },
-            tools = RouterTools,
-            tool_choice = "auto"
+            }
         };
 
         using var request = new HttpRequestMessage(HttpMethod.Post, "chat/completions")
@@ -392,33 +429,65 @@ public sealed class OpenAiLlm : ILlm
             Content = JsonContent.Create(payload)
         };
         using var response = await _http.SendAsync(request, ct);
-        response.EnsureSuccessStatusCode();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync(ct);
+            throw new HttpRequestException(
+                $"LLM вернул {(int)response.StatusCode}: {error[..Math.Min(error.Length, 300)]}");
+        }
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
         var choices = doc.RootElement.GetProperty("choices");
-        if (choices.GetArrayLength() == 0) return new LlmDecision(null, null);
-        var message = choices[0].GetProperty("message");
+        if (choices.GetArrayLength() == 0) return null;
 
-        if (message.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.GetArrayLength() > 0)
+        var message = choices[0].GetProperty("message");
+        var content = message.TryGetProperty("content", out var c) ? c.GetString() : null;
+        return string.IsNullOrWhiteSpace(content) ? null : content.Trim();
+    }
+
+    /// <summary>Общий движок JSON-вызовов: используется и CompleteJsonAsync, и роутером.</summary>
+    private async Task<JsonObject?> CompleteStructuredAsync(
+        string system, string user, JsonReplySchema? schema, CancellationToken ct)
+    {
+        var withSchema = _config.StructuredOutputs && schema is not null && !_schemaUnsupported;
+
+        var (content, providerRejectedSchema) = await CallJsonAsync(system, user, schema, withSchema, ct);
+        if (providerRejectedSchema)
         {
-            var name = toolCalls[0].GetProperty("function").GetProperty("name").GetString();
-            // Имя сверяем с белым списком: провайдер может прислать что-то
-            // неожиданное, и тогда это отказ от вызова, а не повод падать или
-            // запускать поиск вслепую.
-            return new LlmDecision(null, name is not null && KnownTools.Contains(name) ? name : null);
+            _schemaUnsupported = true;
+            (content, _) = await CallJsonAsync(system, user, schema, withSchema: false, ct);
         }
 
-        var text = message.TryGetProperty("content", out var content) ? content.GetString() : null;
-        return new LlmDecision(text, null);
+        var parsed = JsonReply.Extract(content);
+        if (parsed is not null) return parsed;
+
+        var repairUser =
+            user +
+            "\n\n---\nТвой предыдущий ответ не удалось разобрать как JSON:\n" +
+            (string.IsNullOrEmpty(content) ? "(пустой ответ)" : content[..Math.Min(content.Length, 800)]) +
+            "\n\nВерни СТРОГО один JSON-объект. Без markdown, без ```, без пояснений до или после.";
+
+        (content, _) = await CallJsonAsync(system, repairUser, schema, withSchema: false, ct);
+        return JsonReply.Extract(content);
     }
 
     /// <summary>
-    /// Тот же нестримящийся round-trip, что и DecideAsync, но с response_format
-    /// json_object вместо tools — используется для извлечения полей черновика и
-    /// ревью текста, где нужен структурированный, а не диалоговый ответ.
+    /// Один HTTP-ход JSON-вызова. Возвращает содержимое ответа и флаг «провайдер
+    /// не понял json_schema» — по нему вызывающий код повторяет запрос в
+    /// json_object. Прочие не-2xx по-прежнему летят исключением.
     /// </summary>
-    public async Task<JsonObject?> CompleteJsonAsync(string system, string user, CancellationToken ct)
+    private async Task<(string? Content, bool ProviderRejectedSchema)> CallJsonAsync(
+        string system, string user, JsonReplySchema? schema, bool withSchema, CancellationToken ct)
     {
+        object responseFormat = withSchema && schema is not null
+            ? new
+            {
+                type = "json_schema",
+                json_schema = new { name = schema.Name, schema = schema.Schema, strict = true }
+            }
+            : new { type = "json_object" };
+
         var payload = new
         {
             model = _config.LlmModel,
@@ -429,7 +498,7 @@ public sealed class OpenAiLlm : ILlm
                 new { role = "system", content = system },
                 new { role = "user", content = user }
             },
-            response_format = new { type = "json_object" }
+            response_format = responseFormat
         };
 
         using var request = new HttpRequestMessage(HttpMethod.Post, "chat/completions")
@@ -437,14 +506,25 @@ public sealed class OpenAiLlm : ILlm
             Content = JsonContent.Create(payload)
         };
         using var response = await _http.SendAsync(request, ct);
-        response.EnsureSuccessStatusCode();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync(ct);
+            if (withSchema && (int)response.StatusCode == 400 &&
+                error.Contains("response_format", StringComparison.OrdinalIgnoreCase))
+                return (null, true);
+
+            throw new HttpRequestException(
+                $"LLM вернул {(int)response.StatusCode}: {error[..Math.Min(error.Length, 300)]}");
+        }
 
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
         var choices = doc.RootElement.GetProperty("choices");
-        if (choices.GetArrayLength() == 0) return null;
-        var content = choices[0].GetProperty("message").GetProperty("content").GetString();
-        if (string.IsNullOrWhiteSpace(content)) return null;
-        return JsonNode.Parse(content) as JsonObject;
+        if (choices.GetArrayLength() == 0) return (null, false);
+
+        var message = choices[0].GetProperty("message");
+        var content = message.TryGetProperty("content", out var c) ? c.GetString() : null;
+        return (content, false);
     }
 
     public async IAsyncEnumerable<string> StreamAsync(
@@ -473,10 +553,11 @@ public sealed class OpenAiLlm : ILlm
         await using var stream = await response.Content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);
 
-        while (!reader.EndOfStream)
+        // Цикл по ReadLineAsync, а не по reader.EndOfStream: последнее делает
+        // синхронное чтение вперёд и блокирует поток на сетевом I/O.
+        while (await reader.ReadLineAsync(ct) is { } line)
         {
             ct.ThrowIfCancellationRequested();
-            var line = await reader.ReadLineAsync(ct);
             if (string.IsNullOrWhiteSpace(line) || !line.StartsWith("data:", StringComparison.Ordinal))
                 continue;
 

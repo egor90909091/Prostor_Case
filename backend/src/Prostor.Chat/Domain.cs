@@ -49,6 +49,17 @@ public sealed class ExecutorRef
 }
 
 /// <summary>
+/// Вариант из последнего показанного списка услуг. Нужен, чтобы «давай
+/// первый» работало словами: модель называет только номер, идентификатор
+/// подставляет код по этому списку.
+/// </summary>
+public sealed class OptionRef
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = "";
+    [JsonPropertyName("title")] public string Title { get; set; } = "";
+}
+
+/// <summary>
 /// Состояние диалога. Живёт в chat.session.state (jsonb), а не в памяти сервиса
 /// и не в контексте модели: сервис остаётся stateless и переживает рестарт.
 /// </summary>
@@ -68,6 +79,7 @@ public sealed class ChatState
 
     [JsonPropertyName("productId")] public string? ProductId { get; set; }
     [JsonPropertyName("productName")] public string? ProductName { get; set; }
+    [JsonPropertyName("productCategory")] public string? ProductCategory { get; set; }
     [JsonPropertyName("templateId")] public string? TemplateId { get; set; }
     [JsonPropertyName("typicalDays")] public int? TypicalDays { get; set; }
 
@@ -77,6 +89,16 @@ public sealed class ChatState
     [JsonPropertyName("executors")] public List<ExecutorRef> Executors { get; set; } = new();
     [JsonPropertyName("flags")] public Dictionary<string, bool> Flags { get; set; } = new();
     [JsonPropertyName("tzId")] public string? TzId { get; set; }
+
+    /// <summary>Последний показанный список услуг — цель для выбора словами.</summary>
+    [JsonPropertyName("lastOptions")] public List<OptionRef> LastOptions { get; set; } = new();
+
+    /// <summary>
+    /// Какую карточку показали в прошлом ходе. Одно и то же предложение два
+    /// хода подряд превращает диалог в назойливую анкету, поэтому повтор
+    /// подавляется (TurnPipeline.OfferAsync).
+    /// </summary>
+    [JsonPropertyName("lastOffer")] public string? LastOffer { get; set; }
 
     public static ChatState Parse(string json) =>
         JsonSerializer.Deserialize<ChatState>(json, Json.Options) ?? new ChatState();

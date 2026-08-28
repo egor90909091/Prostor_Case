@@ -1,3 +1,6 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -195,6 +198,52 @@ public sealed class Db
         return result;
     }
 
+    /// <summary>
+    /// Плоский транскрипт диалога для экстракции полей ТЗ: по строке на реплику,
+    /// «Заказчик:» / «Ассистент:». Берём только текстовые блоки (реплики
+    /// пользователя и текстовые ответы бота вроде «Записал: объект — …»);
+    /// блоки-действия и карточки в разбор не идут. Хвост обрезаем по лимиту
+    /// символов — на длинных сессиях экономим и контекст, и таймаут.
+    /// </summary>
+    public async Task<string> GetDialogueTranscriptAsync(
+        Guid sessionId, CancellationToken ct, int maxChars = 8000)
+    {
+        var history = await GetHistoryAsync(sessionId, ct);
+        var lines = new List<string>();
+        foreach (var (_, role, blocks, _) in history)
+        {
+            var text = ExtractPlainText(blocks);
+            if (string.IsNullOrWhiteSpace(text)) continue;
+            lines.Add($"{(role == "user" ? "Заказчик" : "Ассистент")}: {text}");
+        }
+
+        var transcript = string.Join("\n", lines).Trim();
+        return transcript.Length <= maxChars
+            ? transcript
+            : transcript[^maxChars..];
+    }
+
+    private static string? ExtractPlainText(string blocksJson)
+    {
+        try
+        {
+            if (JsonNode.Parse(blocksJson) is not JsonArray array) return null;
+            var parts = new List<string>();
+            foreach (var block in array)
+            {
+                if (block is not JsonObject obj) continue;
+                if (obj["type"]?.GetValue<string>() != "text") continue;
+                var text = obj["text"]?.GetValue<string>();
+                if (!string.IsNullOrWhiteSpace(text)) parts.Add(text.Trim());
+            }
+            return parts.Count == 0 ? null : string.Join(" ", parts);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     // ------------------------------------------------------------- ходы диалога
     /// <summary>
     /// Идемпотентность и защита от параллельных ходов: пара
@@ -323,6 +372,24 @@ public sealed class Db
                 rd.IsDBNull(11) ? Array.Empty<string>() : rd.GetFieldValue<string[]>(11),
                 rd.IsDBNull(12) ? "" : rd.GetString(12)));
         }
+        return result;
+    }
+
+    /// <summary>
+    /// Полный справочник компаний — для переключателя роли в шапке.
+    /// Это не поиск: ранжирование здесь не при чём, нужен ровный список
+    /// всех активных исполнителей в алфавитном порядке.
+    /// </summary>
+    public async Task<List<CompanyRef>> ListCompaniesAsync(CancellationToken ct)
+    {
+        var result = new List<CompanyRef>();
+        await using var cmd = _source.CreateCommand(
+            "SELECT company_id, code, name, rating FROM catalog.company " +
+            "WHERE is_active ORDER BY name");
+        await using var rd = await cmd.ExecuteReaderAsync(ct);
+        while (await rd.ReadAsync(ct))
+            result.Add(new CompanyRef(
+                rd.GetString(0), rd.GetString(1), rd.GetString(2), rd.GetInt32(3)));
         return result;
     }
 
@@ -519,6 +586,38 @@ public sealed class Db
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    /// <summary>
+    /// Витрина согласования ТЗ. Отдельным запросом, а не частью общего
+    /// дашборда: миграция 08_review.sql могла быть не накачена на живой базе,
+    /// и тогда весь экран аналитики падал бы из-за отсутствующей таблицы.
+    /// null означает «раздела согласования на дашборде не будет».
+    /// </summary>
+    public async Task<string?> GetReviewStatsJsonAsync(CancellationToken ct)
+    {
+        const string sql = """
+            SELECT json_build_object(
+              'sent',     count(*)::int,
+              'pending',  count(*) FILTER (WHERE status IN ('sent', 'viewed'))::int,
+              'approved', count(*) FILTER (WHERE status = 'approved')::int,
+              'revision', count(*) FILTER (WHERE status = 'revision')::int,
+              'rejected', count(*) FILTER (WHERE status = 'rejected')::int,
+              'avgDecisionHours', coalesce(round(avg(
+                   extract(epoch FROM (decided_at - created_at)) / 3600
+                 ) FILTER (WHERE decided_at IS NOT NULL))::int, 0)
+            )::text
+            FROM tz.assignment
+            """;
+        try
+        {
+            await using var cmd = _source.CreateCommand(sql);
+            return (string?)await cmd.ExecuteScalarAsync(ct);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     public async Task<string> GetAnalyticsJsonAsync(CancellationToken ct)
     {
         // Одним запросом собираем весь дашборд: пять витрин из требований к MVP
@@ -591,3 +690,5 @@ public sealed class Db
         return (string)(await cmd.ExecuteScalarAsync(ct))!;
     }
 }
+
+public sealed record CompanyRef(string CompanyId, string Code, string Name, int Rating);

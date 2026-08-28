@@ -331,20 +331,34 @@ async Task<ChatState> RunTurnAsync(
         await db.AppendMessageAsync(sessionId, "user", userBlocks.ToJsonString(), turnCt);
 
         var collected = new List<Block>();
+        // Стримящийся ответ приходит дельтами, а не блоком, и раньше нигде не
+        // сохранялся: при перезагрузке страницы реплики ассистента исчезали, а
+        // в транскрипт диалога (а значит и в контекст следующего хода) попадали
+        // только служебные текстовые блоки. Собираем дельты обратно в один
+        // текстовый блок — он идёт первым, как и на экране.
+        var spoken = new StringBuilder();
         Task Collect(string name, object payload, CancellationToken token)
         {
-            if (name == "block" && payload is not null)
+            if (payload is not null)
             {
-                var node = JsonNode.Parse(Json.Write(payload))?["block"];
-                if (node is not null) collected.Add(JsonSerializer.Deserialize<Block>(node.ToJsonString(), Json.Options)!);
+                var node = JsonNode.Parse(Json.Write(payload));
+                if (name == "block" && node?["block"] is { } blockNode)
+                    collected.Add(JsonSerializer.Deserialize<Block>(blockNode.ToJsonString(), Json.Options)!);
+                else if (name == "delta" && node?["text"] is JsonValue value &&
+                         value.TryGetValue<string>(out var text))
+                    spoken.Append(text);
             }
             return EmitAsync(name, payload!, token);
         }
 
         state = await pipeline.RunAsync(sessionId, state, request, Collect, turnCt);
 
+        var message = new List<Block>();
+        if (spoken.Length > 0) message.Add(Block.TextBlock(spoken.ToString().Trim()));
+        message.AddRange(collected);
+
         await db.SaveStateAsync(sessionId, state, CancellationToken.None);
-        await db.AppendMessageAsync(sessionId, "assistant", Json.Write(collected), CancellationToken.None);
+        await db.AppendMessageAsync(sessionId, "assistant", Json.Write(message), CancellationToken.None);
         await db.FinishTurnAsync(turnId, "done", CancellationToken.None);
         await EmitAsync("done", new { turnId }, turnCt);
     }
@@ -459,6 +473,12 @@ app.MapGet("/api/v1/catalog/products/{productId}/similar", async (
     string productId, Db db, CancellationToken ct) =>
     Results.Ok(new { items = await db.GetSimilarCalcsAsync(productId, 6, ct) }));
 
+// Справочник компаний для переключателя роли в шапке: под ролью подрядчика
+// приложение показывает входящие ТЗ этой компании. Ролевого разграничения
+// доступа за этим нет — см. docs/architecture.md.
+app.MapGet("/api/v1/catalog/companies", async (Db db, CancellationToken ct) =>
+    Results.Ok(new { items = await db.ListCompaniesAsync(ct) }));
+
 // Подбор исполнителей по способностям — без выбранной услуги и без периода.
 // Отвечает на вопрос «кто вообще это умеет»; занятости здесь нет, потому что
 // без периода она не определена (для неё — /api/v1/executors/search ниже).
@@ -497,7 +517,18 @@ app.MapPost("/api/v1/executors/search", async (
 });
 
 app.MapGet("/api/v1/analytics/overview", async (Db db, CancellationToken ct) =>
-    Results.Content(await db.GetAnalyticsJsonAsync(ct), "application/json"));
+{
+    var overview = await db.GetAnalyticsJsonAsync(ct);
+    var review = await db.GetReviewStatsJsonAsync(ct);
+    // Витрина согласования подмешивается сюда, а не считается внутри общего
+    // запроса: без накаченной 08_review.sql таблицы tz.assignment нет, и
+    // общий дашборд не должен из-за этого падать целиком.
+    if (review is null) return Results.Content(overview, "application/json");
+
+    var node = JsonNode.Parse(overview)!.AsObject();
+    node["review"] = JsonNode.Parse(review);
+    return Results.Content(node.ToJsonString(), "application/json");
+});
 
 // ------------------------------------------------------------------ ревью
 // НЕ /api/v1/tz/... — nginx/vite проксируют этот префикс на Prostor.Tz
@@ -537,6 +568,38 @@ severity — всегда "warning" или "info", никогда ничего �
 Если проблем не нашёл — {"issues": []}.
 """;
 
+// Форма ответа ревью — для response_format json_schema (когда включён
+// LLM_STRUCTURED_OUTPUTS) и как страховка при json_object-провайдере.
+var reviewSchema = new JsonReplySchema("tz_review", new JsonObject
+{
+    ["type"] = "object",
+    ["properties"] = new JsonObject
+    {
+        ["issues"] = new JsonObject
+        {
+            ["type"] = "array",
+            ["items"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["title"] = new JsonObject { ["type"] = "string" },
+                    ["detail"] = new JsonObject { ["type"] = "string" },
+                    ["severity"] = new JsonObject
+                    {
+                        ["type"] = "string",
+                        ["enum"] = new JsonArray("warning", "info")
+                    }
+                },
+                ["required"] = new JsonArray("title", "detail", "severity"),
+                ["additionalProperties"] = false
+            }
+        }
+    },
+    ["required"] = new JsonArray("issues"),
+    ["additionalProperties"] = false
+});
+
 static string BuildReviewUserPrompt(JsonObject state)
 {
     string? Get(string key) => StrValue(state[key]);
@@ -566,7 +629,8 @@ app.MapPost("/api/v1/review/draft", async (
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromSeconds(cfg.LlmTimeoutSeconds));
-        result = await llm.CompleteJsonAsync(ReviewSystemPrompt, BuildReviewUserPrompt(state), cts.Token);
+        result = await llm.CompleteJsonAsync(
+            ReviewSystemPrompt, BuildReviewUserPrompt(state), reviewSchema, cts.Token);
     }
     catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
     {

@@ -1,7 +1,14 @@
 using System.Net.Http.Json;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace Prostor.Chat;
+
+/// <summary>Одно текстовое поле ТЗ: идентификатор, заголовок и подсказка из
+/// шаблона (tz.template.required_fields). Нужен экстрактору полей из диалога,
+/// чтобы модель раскладывала переписку по реальным полям конструктора, а не
+/// по захардкоженному списку.</summary>
+public sealed record TzTextField(string Key, string Title, string? Hint);
 
 public sealed class AppConfig
 {
@@ -28,16 +35,29 @@ public sealed class AppConfig
     /// <summary>Без адреса эмбеддера каталог индексируется детерминированной заглушкой.</summary>
     public bool UseStubEmbedder => string.IsNullOrWhiteSpace(EmbeddingBaseUrl);
 
+    /// <summary>
+    /// Слать ли в JSON-вызовах response_format json_schema (строгая схема)
+    /// вместо json_object. По умолчанию false: DeepSeek на дефолтном эндпоинте
+    /// строгую схему не держит, а json_object держит. true имеет смысл для
+    /// OpenAI-совместимых провайдеров с поддержкой Structured Outputs (OpenAI,
+    /// vLLM с guided json и т.п.). Если провайдер json_schema не понял, клиент
+    /// сам откатывается на json_object; битый JSON чинится повторным вызовом
+    /// независимо от этого флага (см. OpenAiLlm.CompleteJsonAsync).
+    /// </summary>
+    public bool StructuredOutputs { get; init; } = false;
+
     public int EmbeddingTimeoutSeconds { get; init; } = 5;
     public int LlmTimeoutSeconds { get; init; } = 45;
     public int TurnTimeoutSeconds { get; init; } = 60;
     public int HeartbeatSeconds { get; init; } = 15;
 
     /// <summary>
-    /// Рубильник роутера свободного текста (см. TurnPipeline.TryRouteAsync).
-    /// false — старое поведение: любой свободный текст трактуется как поиск услуг,
-    /// ILlm.DecideAsync вообще не вызывается. Быстрый откат без деплоя, если
-    /// провайдер плохо держит tool calling.
+    /// Рубильник «мозга» диалога (см. TurnPipeline.ThinkAsync). false — ход
+    /// идёт по детерминированной ветке Brain.Fallback: без выбранной услуги
+    /// любой свободный текст трактуется как поиск, с выбранной — ответ
+    /// собирается из состояния заявки. Быстрый откат без деплоя, если провайдер
+    /// плохо держит структурированный ответ. Имя переменной оставлено прежним
+    /// (ENABLE_ROUTER), чтобы не ломать существующие .env.
     /// </summary>
     public bool EnableRouter { get; init; } = true;
 
@@ -112,6 +132,8 @@ public sealed class AppConfig
             EmbeddingModel = Get("EMBEDDING_MODEL", "bge-m3"),
             EmbeddingDimensions = GetInt("EMBEDDING_DIMENSIONS", 1024),
 
+            StructuredOutputs = GetBool("LLM_STRUCTURED_OUTPUTS", false),
+
             EmbeddingTimeoutSeconds = GetInt("EMBEDDING_TIMEOUT_SECONDS", 5),
             LlmTimeoutSeconds = GetInt("LLM_TIMEOUT_SECONDS", 45),
             TurnTimeoutSeconds = GetInt("TURN_TIMEOUT_SECONDS", 60),
@@ -142,6 +164,64 @@ public sealed class TzClient
         _log = log;
         _http.BaseAddress = new Uri(config.TzBaseUrl.TrimEnd('/') + "/");
         _http.Timeout = TimeSpan.FromSeconds(5);
+    }
+
+    // Поля со значением-действием (клик, а не текст) экстрактору из диалога не
+    // нужны: сроки/этапы/операции/исполнители заполняются кнопками и уже лежат
+    // в ChatState. Модель раскладывает по диалогу только свободный текст.
+    private static readonly HashSet<string> NonTextFieldKeys =
+        new(StringComparer.Ordinal) { "period", "stages", "operations", "executors" };
+
+    /// <summary>
+    /// Список текстовых полей шаблона ТЗ (key/title/hint) для экстракции из
+    /// диалога. Читается из конструктора по HTTP (GET /api/v1/tz/templates) —
+    /// общих таблиц у сервисов нет. Отказ/недоступность — пустой список,
+    /// вызывающая сторона решает, что показать пользователю.
+    /// </summary>
+    public async Task<IReadOnlyList<TzTextField>> GetTextFieldsAsync(string? templateId, CancellationToken ct)
+    {
+        var wanted = string.IsNullOrWhiteSpace(templateId) ? "tpl-generic" : templateId;
+        try
+        {
+            using var response = await _http.GetAsync("api/v1/tz/templates", ct);
+            response.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+
+            if (!doc.RootElement.TryGetProperty("items", out var items) ||
+                items.ValueKind != JsonValueKind.Array)
+                return Array.Empty<TzTextField>();
+
+            JsonElement? chosen = null;
+            JsonElement? generic = null;
+            foreach (var t in items.EnumerateArray())
+            {
+                var id = t.TryGetProperty("id", out var idEl) ? idEl.GetString() : null;
+                if (id == wanted) { chosen = t; break; }
+                if (id == "tpl-generic") generic = t;
+            }
+            chosen ??= generic;
+            if (chosen is null ||
+                !chosen.Value.TryGetProperty("fields", out var fields) ||
+                fields.ValueKind != JsonValueKind.Array)
+                return Array.Empty<TzTextField>();
+
+            var result = new List<TzTextField>();
+            foreach (var f in fields.EnumerateArray())
+            {
+                var key = f.TryGetProperty("key", out var k) ? k.GetString() : null;
+                if (string.IsNullOrEmpty(key) || NonTextFieldKeys.Contains(key)) continue;
+                result.Add(new TzTextField(
+                    key,
+                    f.TryGetProperty("title", out var ti) ? ti.GetString() ?? key : key,
+                    f.TryGetProperty("hint", out var h) ? h.GetString() : null));
+            }
+            return result;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _log.LogWarning(ex, "не удалось получить список полей ТЗ из конструктора");
+            return Array.Empty<TzTextField>();
+        }
     }
 
     public async Task<JsonObject?> DraftAsync(Guid sessionId, ChatState state, CancellationToken ct)

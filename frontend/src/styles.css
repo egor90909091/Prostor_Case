@@ -178,7 +178,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .top-select:focus { outline: none; border-color: var(--brand); box-shadow: var(--ring); }
 
 @media (max-width: 1180px) {
-  .crumbs, .top-select { display: none; }
+  .crumbs { display: none; }
 }
 
 main { flex: 1; padding: 20px 24px 60px; max-width: 1440px; width: 100%; margin: 0 auto; }
@@ -207,6 +207,10 @@ h1, h2, h3, h4 { color: var(--ink); }
   background: var(--surface); border: 1px solid var(--line);
   border-radius: 10px 10px 10px 2px; padding: 11px 15px; margin: 0 0 10px;
   box-shadow: var(--shadow-sm);
+  /* Ответ ассистента может состоять из двух частей одного хода (реплика в
+     контексте разговора и текст по результатам поиска) — они приходят
+     дельтами в один блок и разделяются пустой строкой. */
+  white-space: pre-line;
 }
 .msg-action { font-size: 13px; }
 
@@ -249,6 +253,15 @@ h1, h2, h3, h4 { color: var(--ink); }
 .composer input:focus { outline: none; border-color: var(--brand); box-shadow: var(--ring); }
 
 .examples { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+/* Подсказки следующей реплики прямо под ответом: тот же чип, что и примеры
+   внизу, но в потоке диалога — предложение, а не обязательный шаг. */
+.suggestions { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 2px; }
+
+/* Строка «что записалось в заявку» — служебная пометка под ответом, поэтому
+   мельче и тише самого ответа. */
+.captured { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+.captured-label { color: var(--ink-3); font-size: 12.5px; }
 .chip {
   background: var(--surface); border: 1px solid var(--line); border-radius: 999px;
   padding: 6px 13px; font-size: 13px; cursor: pointer; color: var(--ink-2);
@@ -291,6 +304,14 @@ h1, h2, h3, h4 { color: var(--ink); }
 .cards .card:nth-child(n+6) { animation-delay: 300ms; }
 .card.success { border-color: var(--ok); background: var(--ok-soft); }
 .card.hint { background: var(--brand-50); border-color: var(--brand-100); }
+/* Карточка услуги, выбранной в текущей заявке: остаётся подсвеченной в любом
+   месте истории диалога, в том числе после перезагрузки страницы. */
+.card.selected {
+  border-color: var(--brand);
+  background: var(--brand-50);
+  box-shadow: 0 0 0 2px var(--brand-100), var(--shadow-sm);
+}
+.selected-badge { margin-left: 8px; vertical-align: 1px; }
 
 /* Неуверенная выдача: точного соответствия нет, показываем как догадку.
    Приглушено намеренно — карточка не должна выглядеть находкой, пока
@@ -395,15 +416,25 @@ h1, h2, h3, h4 { color: var(--ink); }
 input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; margin-top: 2px; }
 
 .plain { list-style: none; margin: 8px 0 0; padding: 0; }
-.plain li { padding: 3px 0; font-size: 14px; }
+/* :where() обнуляет вес селектора. Без него `.plain li` (класс + тег) весит
+   больше, чем классы самих строк, и перебивал их собственные отступы: строки
+   списков (.doc-row, .review-item, .assignment-row, .version-row) прижимались
+   текстом к рамке, хотя каждая задаёт себе padding. Здесь нужен дефолт для
+   голого li, а не правило, спорящее с оформлением конкретной строки. */
+.plain :where(li) { padding: 3px 0; font-size: 14px; }
 .icon { color: var(--brand); }
 
 .collapse { background: none; border: none; padding: 0; cursor: pointer; font-weight: 600; color: var(--brand); }
 .collapse:hover { color: var(--brand-600); text-decoration: underline; }
 
-.mini { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-top: 8px; }
+.mini { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-top: 8px; table-layout: fixed; }
 .mini th { text-align: left; color: var(--ink-3); font-weight: 600; padding: 4px 8px 4px 0; }
 .mini td { padding: 5px 8px 5px 0; border-top: 1px solid var(--line-2); }
+/* Ширины колонок задаёт colgroup таблицы, поэтому раскладка фиксированная:
+   при auto длинные названия услуг и объектов растягивали таблицу шире
+   карточки, и правые столбцы уезжали за её край. Длинное слово переносится
+   внутри ячейки, а не расширяет столбец. */
+.mini th, .mini td { overflow-wrap: break-word; }
 
 .muted { color: var(--ink-3); }
 .small { font-size: 12.5px; }
@@ -476,6 +507,18 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
 .missing { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
 .missing .tag { animation: pop-in var(--dur-mid) var(--ease-spring) both; }
 
+/* Сводка выбранного в диалоге: услуга всегда на виду, слоты подтягиваются
+   по мере заполнения. Фирменная плашка с левой полосой — как .rec, но
+   самостоятельный блок, а не пункт списка. */
+.card.summary { border-left: 3px solid var(--brand); margin-bottom: 6px; animation: pop-in var(--dur-mid) var(--ease-spring) both; }
+.card.summary.empty { border-left-color: var(--line); }
+.summary-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--brand); font-weight: 600; margin-bottom: 4px; }
+.summary-title { font-weight: 600; color: var(--ink); line-height: 1.35; }
+.summary-sub { color: var(--ink-3); font-size: 12.5px; margin-top: 2px; }
+.summary-rows { margin-top: 6px; }
+.summary-rows .slot { padding: 6px 0; }
+.summary-rows .slot:last-child { border-bottom: none; }
+
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ==========================================================================
@@ -489,14 +532,23 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
 .field { margin: 12px 0; }
 .field label { display: block; font-size: 13px; color: var(--ink-2); margin-bottom: 5px; }
 .field label .req { color: var(--danger); }
-.field input, .field textarea, select {
+.field input, .field textarea, select,
+.review-form textarea, .review-decision textarea, .send-panel textarea {
   width: 100%; padding: 8px 11px; border: 1px solid var(--line);
   border-radius: var(--r-sm); background: var(--surface); resize: vertical;
   transition: border-color var(--dur-mid) var(--ease-out), box-shadow var(--dur-mid) var(--ease-out);
 }
-.field input::placeholder, .field textarea::placeholder { color: var(--ink-3); }
-.field input:hover, .field textarea:hover, select:hover { border-color: var(--brand-300); }
-.field input:focus, .field textarea:focus, select:focus { outline: none; border-color: var(--brand); box-shadow: var(--ring); }
+.field input::placeholder, .field textarea::placeholder,
+.review-form textarea::placeholder, .review-decision textarea::placeholder,
+.send-panel textarea::placeholder { color: var(--ink-3); }
+.field input:hover, .field textarea:hover, select:hover,
+.review-form textarea:hover, .review-decision textarea:hover,
+.send-panel textarea:hover { border-color: var(--brand-300); }
+.field input:focus, .field textarea:focus, select:focus,
+.review-form textarea:focus, .review-decision textarea:focus,
+.send-panel textarea:focus {
+  outline: none; border-color: var(--brand); box-shadow: var(--ring);
+}
 
 .preview-section { border-top: 1px solid var(--line-2); padding-top: 10px; margin-top: 10px; }
 .preview-section h4 { margin: 0 0 4px; font-size: 13.5px; color: var(--brand); }
@@ -513,6 +565,86 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
   border-left: 3px solid var(--orange);
 }
 .banner.error { background: var(--danger-soft); border-color: var(--danger-line); border-left-color: var(--danger); color: var(--danger); }
+
+/* --- Зона готового документа ------------------------------------------------
+   Финал сценария: здесь ТЗ перестаёт быть формой и становится документом.
+   Поэтому блок оформлен как «выдача», а не как ещё одна карточка формы:
+   шапка со статусом, три крупных действия (два формата файла и переход в
+   «Мои заявки» именно на этот документ) и предпросмотр под ними. */
+.doc-ready { border-color: var(--brand-100); padding: 0; overflow: hidden; }
+
+.doc-ready-head {
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 16px 18px; background: linear-gradient(180deg, var(--brand-50), var(--surface));
+  border-bottom: 1px solid var(--line-2);
+}
+.doc-ready-icon {
+  flex: none; width: 44px; height: 44px; border-radius: var(--r-lg);
+  background: var(--brand); color: #fff; display: grid; place-items: center;
+  box-shadow: var(--shadow-sm);
+}
+.doc-ready-icon svg { width: 22px; height: 22px; }
+.doc-ready-title { min-width: 0; }
+.doc-ready-label {
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--brand); margin-bottom: 2px;
+}
+.doc-ready-title h3 {
+  margin: 0 0 8px; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.doc-ready-meta { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+
+.doc-ready-files {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px; padding: 14px 18px;
+}
+.file-card {
+  display: flex; gap: 11px; align-items: center; text-align: left;
+  padding: 11px 13px; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--surface); color: var(--ink); cursor: pointer; font: inherit;
+  text-decoration: none;
+  transition: border-color var(--dur-mid) var(--ease-out), box-shadow var(--dur-mid) var(--ease-out),
+              transform var(--dur-mid) var(--ease-out), background var(--dur-mid) var(--ease-out);
+}
+.file-card:hover { border-color: var(--brand-300); box-shadow: var(--shadow-md); transform: translateY(-2px); }
+.file-card:active { transform: translateY(0); box-shadow: none; }
+.file-card:focus-visible { outline: none; box-shadow: var(--ring); }
+.file-card-icon {
+  flex: none; width: 34px; height: 34px; border-radius: var(--r-md);
+  display: grid; place-items: center; background: var(--brand-50); color: var(--brand);
+  font-size: 16px; font-weight: 700;
+}
+.file-card-icon svg { width: 18px; height: 18px; }
+.file-card-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.file-card-body strong { font-size: 13.5px; font-weight: 600; }
+.file-card-body .small { line-height: 1.35; }
+
+/* Формат читается по цвету: Word — фирменный синий, PDF — оранжевый акцент. */
+.file-card.pdf .file-card-icon { background: var(--orange-soft); color: var(--orange-dark); }
+.file-card.pdf:hover { border-color: var(--orange); }
+.file-card.go { background: var(--brand); border-color: var(--brand); color: #fff; }
+.file-card.go .file-card-icon { background: rgba(255, 255, 255, 0.18); color: #fff; }
+.file-card.go .muted { color: rgba(255, 255, 255, 0.78); }
+.file-card.go:hover { background: var(--brand-600); border-color: var(--brand-600); }
+
+.doc-ready-preview { padding: 0 18px 18px; }
+.doc-ready-preview-head {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px;
+}
+
+/* Компактный близнец в липкой панели: тот же результат, но под рукой,
+   пока пользователь листает форму. */
+/* Карточка текущего документа в панели чата — тот же документ, что в
+   конструкторе и «Мои заявки», просто в компактном виде. */
+.doc-chip { border-color: var(--brand-100); }
+.doc-chip-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.doc-chip-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.doc-chip-actions .btn { margin-top: 0; }
+
+.side-result { display: flex; flex-direction: column; gap: 4px; }
+.side-result-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.side-result-actions .btn { margin-top: 0; }
 
 /* ==========================================================================
    Мои заявки
@@ -551,6 +683,9 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
 .doc-row-body { min-width: 0; flex: 1; }
 .doc-row-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 2px; }
 .doc-row-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Дата — одной строкой: в узкой колонке она разрывалась после «27.08.2026,»
+   и строка списка вырастала на пятую линию ради переноса времени. */
+.doc-row-head > span { white-space: nowrap; }
 .doc-row-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .doc-row-meta { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
 
@@ -581,13 +716,94 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
 .version-row:hover { background: var(--brand-50); }
 .version-row.on { color: var(--brand); font-weight: 600; }
 .version-num { font-variant-numeric: tabular-nums; min-width: 28px; font-weight: 600; }
-.version-row .btn { margin-left: auto; }
+.version-files { margin-left: auto; display: flex; gap: 6px; }
+.version-files .btn { margin-top: 0; }
 
 .docx-host {
   border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg);
   padding: 16px; max-height: 70vh; overflow: auto;
 }
 .docx-preview { background: transparent; }
+
+/* ==========================================================================
+   Согласование ТЗ: роль подрядчика, направления и замечания
+   ========================================================================== */
+
+/* Фильтры входящих — те же чипы, что в чате, плюс активное состояние. */
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip.on {
+  border-color: var(--brand); color: var(--brand); background: var(--brand-50); font-weight: 600;
+}
+.chip .count {
+  margin-left: 6px; background: var(--brand); color: #fff; border-radius: 999px;
+  padding: 0 6px; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+}
+/* Ряд фильтров над списком: и во входящих подрядчика, и в «Мои заявки». */
+.list-filters { margin: -4px 0 14px; }
+.inbox-actor { font-weight: 400; }
+
+/* Сопроводительная записка заказчика — реплика, а не поле формы. */
+.review-note {
+  background: var(--brand-50); border: 1px solid var(--brand-100); border-radius: var(--r-md);
+  padding: 11px 15px; margin-bottom: 12px; font-size: 13.5px; line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.review-block, .review-decision, .send-panel {
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 14px 16px; margin-bottom: 12px; background: var(--surface-2);
+}
+.review-block > .card-title,
+.review-decision > .card-title,
+.send-panel > .card-title { margin-bottom: 10px; }
+.review-decision-actions, .send-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.send-companies { margin-bottom: 12px; }
+.review-decision textarea, .send-panel textarea { box-sizing: border-box; }
+.review-decision p { margin: 0; }
+
+/* Направления: одна строка — одна компания и её статус. */
+.assignment-list { margin: 0; }
+.assignment-row {
+  display: flex; align-items: center; gap: 9px; row-gap: 5px; flex-wrap: wrap;
+  padding: 9px 0; border-bottom: 1px solid var(--line-2);
+}
+.assignment-row:first-child { padding-top: 0; }
+.assignment-row:last-child { border-bottom: none; }
+
+/* Лента замечаний. Свои реплики прижаты к правому краю, вердикт выделен
+   рамкой — в ленте он должен читаться как событие, а не как ещё одна фраза. */
+.review-list { margin: 0 0 14px; display: flex; flex-direction: column; gap: 10px; }
+.review-item {
+  border: 1px solid var(--line); border-radius: var(--r-md); padding: 12px 15px;
+  background: var(--surface); max-width: 88%;
+}
+.review-item.own { align-self: flex-end; background: var(--brand-50); border-color: var(--brand-100); }
+/* Полоса вердикта утолщает левую границу на 2px — компенсируем padding,
+   иначе текст решения стоит не по одной вертикали с остальными репликами. */
+.review-item.decision { border-left: 3px solid var(--orange); padding-left: 13px; }
+.review-item p { margin: 7px 0 0; font-size: 13.5px; line-height: 1.5; }
+.review-item-head {
+  display: flex; align-items: center; gap: 9px; row-gap: 5px; flex-wrap: wrap;
+  font-size: 13px; line-height: 1.4;
+}
+.review-section {
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 999px;
+  padding: 2px 9px; font-size: 12px; line-height: 1.5; color: var(--ink-2);
+}
+/* Кнопка-призрак несёт собственный padding: без компенсации её подпись
+   стояла бы с отступом относительно текста замечания над ней. */
+.review-item .btn.ghost { margin: 9px 0 0 -10px; }
+
+.review-form { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+.review-form textarea { flex: 1; min-width: 220px; }
+.review-form .btn { margin-top: 0; }
+.review-section-select { height: 36px; }
+
+/* Поля раздела, к которому подрядчик оставил замечание. */
+.field.flagged input, .field.flagged textarea {
+  border-color: var(--orange); box-shadow: 0 0 0 3px var(--orange-soft);
+}
+.field.flagged label { color: var(--warn); font-weight: 600; }
 
 /* ==========================================================================
    Аналитика
@@ -608,6 +824,9 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
 
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
 .panel { margin: 0; }
+/* Панели с таблицами занимают всю строку сетки: в колонке 360px пять
+   столбцов не помещаются даже при переносе текста. */
+.panel-wide { grid-column: 1 / -1; }
 
 .bars { display: flex; flex-direction: column; gap: 7px; margin-top: 10px; }
 .bar-row { display: grid; grid-template-columns: minmax(0, 1fr) 120px 34px; gap: 10px; align-items: center; font-size: 13px; }
@@ -616,8 +835,19 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
 .bar-fill { display: block; height: 100%; background: var(--brand); border-radius: 999px; }
 .bar-value { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-3); }
 
-.sev.blocking { color: var(--danger); }
-.sev.warning { color: var(--warn); }
+/* Типичные ошибки в аналитике — те же строки риска, что и в конструкторе,
+   плюс счётчик справа. Бейдж стоит в колонке фиксированной ширины, иначе
+   заголовки съезжают друг относительно друга, а длинные — заворачиваются
+   под бейдж вместо ровного левого края. */
+.risk-stats { margin: 8px 0 0; }
+.risk-stats .risk { align-items: flex-start; gap: 10px; }
+.risk-stats .risk:first-child { border-top: none; padding-top: 0; }
+.risk-stats .sev { width: 66px; padding: 2px 0; text-align: center; }
+.risk-stat-title { flex: 1; min-width: 0; }
+.risk-stat-count {
+  flex: none; margin-left: auto; font-weight: 700;
+  font-variant-numeric: tabular-nums; color: var(--ink-3);
+}
 
 /* Диаграммы */
 .donut-wrap { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; }
@@ -789,7 +1019,10 @@ input[type="checkbox"] { accent-color: var(--brand); width: 15px; height: 15px; 
     font-size: 13px; color: var(--ink);
   }
   .crumbs span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .topbar-nav, .topbar-right { display: none; }
+  .topbar-nav { display: none; }
+  /* Переключатель роли остаётся: он определяет всё приложение целиком,
+     и потерять его на телефоне значит запереть пользователя в роли. */
+  .top-select { min-width: 92px; font-size: 12px; }
 
   /* --- нижняя панель вкладок --- */
   .tabbar {

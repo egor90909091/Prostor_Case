@@ -39,6 +39,12 @@ $RECYCLE.BIN/
 *.pfx
 secrets/
 
+# Local AI assistant config (may contain API keys)
+opencode.json
+.mcp.json
+.mcp.local.json
+.opencode/
+
 # ─────────────────────────────────────────────
 # Logs & runtime
 # ─────────────────────────────────────────────

@@ -23,7 +23,14 @@ var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web)
     Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
 };
 
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+// pdf в ответе — не украшение: без шрифта с кириллицей выгрузка в PDF
+// невозможна, и это должно быть видно снаружи, а не только по 503 в момент
+// скачивания (см. PdfFonts).
+app.MapGet("/health", () => Results.Ok(new
+{
+    status = "ok",
+    pdf = PdfFonts.Available ? "ready" : "no-font"
+}));
 
 app.MapGet("/api/v1/tz/templates", async (TzDb db, CancellationToken ct) =>
 {
@@ -163,6 +170,7 @@ app.MapPost("/api/v1/tz/documents", async (
         recommendation = draft.Recommendation,
         storageKey = stored ? key : null,
         downloadUrl = $"/api/v1/tz/documents/{saved.TzId}/file",
+        pdfUrl = $"/api/v1/tz/documents/{saved.TzId}/file?format=pdf",
         stored,
         parentTzId = body.ParentTzId,
         version = saved.Version,
@@ -193,7 +201,8 @@ app.MapGet("/api/v1/tz/documents/{tzId:guid}", async (Guid tzId, TzDb db, Cancel
         status = document.Status,
         risks = JsonNode.Parse(document.Risks),
         payload = JsonNode.Parse(document.Payload),
-        downloadUrl = $"/api/v1/tz/documents/{tzId}/file"
+        downloadUrl = $"/api/v1/tz/documents/{tzId}/file",
+        pdfUrl = $"/api/v1/tz/documents/{tzId}/file?format=pdf"
     }, jsonOptions);
 });
 
@@ -216,7 +225,8 @@ app.MapGet("/api/v1/tz/documents/{tzId:guid}/versions", async (
             productName = v.ProductName,
             objectName = v.ObjectName,
             status = v.Status,
-            downloadUrl = $"/api/v1/tz/documents/{v.TzId}/file"
+            downloadUrl = $"/api/v1/tz/documents/{v.TzId}/file",
+            pdfUrl = $"/api/v1/tz/documents/{v.TzId}/file?format=pdf"
         })
     }, jsonOptions);
 });
@@ -225,15 +235,22 @@ app.MapGet("/api/v1/tz/documents/{tzId:guid}/versions", async (
 // сети браузеру недоступен, а гонять пользователя через две системы имён —
 // лишняя сложность для прототипа.
 app.MapGet("/api/v1/tz/documents/{tzId:guid}/file", async (
-    Guid tzId, TzDb db, DocumentStorage storage, CancellationToken ct) =>
+    Guid tzId, string? format, TzDb db, DocumentStorage storage, CancellationToken ct) =>
 {
     var document = await db.GetDocumentAsync(tzId, ct);
     if (document is null) return Results.NotFound();
 
-    var name = $"ТЗ_{tzId.ToString()[..8]}.docx";
-    const string contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    var pdf = string.Equals(format, "pdf", StringComparison.OrdinalIgnoreCase);
+    var name = $"ТЗ_{tzId.ToString()[..8]}." + (pdf ? "pdf" : "docx");
+    var contentType = pdf
+        ? "application/pdf"
+        : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
-    if (!string.IsNullOrEmpty(document.StorageKey))
+    // В хранилище лежит только .docx: PDF — представление того же документа,
+    // а не отдельная сущность, поэтому собирается на лету из payload. Так не
+    // нужно ни версионировать два файла, ни решать, что делать со старыми
+    // документами, созданными до появления PDF.
+    if (!pdf && !string.IsNullOrEmpty(document.StorageKey))
     {
         try
         {
@@ -246,14 +263,168 @@ app.MapGet("/api/v1/tz/documents/{tzId:guid}/file", async (
         }
     }
 
-    // Файл потерян или хранилище было недоступно — собираем документ заново
+    // Файл потерян, хранилище было недоступно или запрошен PDF — собираем
+    // документ заново из сохранённого payload.
     var template = await db.GetTemplateAsync(document.TemplateId, ct);
     if (template is null) return Results.NotFound();
 
     var state = JsonNode.Parse(document.Payload)!.AsObject();
     var typicalDays = await db.GetTypicalDaysAsync(document.ProductId, ct);
     var draft = Drafting.Build(template, state, typicalDays);
-    return Results.File(DocxWriter.Build(draft, state), contentType, name);
+
+    if (!pdf) return Results.File(DocxWriter.Build(draft, state), contentType, name);
+
+    if (!PdfFonts.Available)
+        return Results.Json(new { error = "pdf_unavailable", hint = PdfFonts.MissingFontHint },
+            jsonOptions, statusCode: StatusCodes.Status503ServiceUnavailable);
+
+    return Results.File(PdfWriter.Build(draft, state), contentType, name);
+});
+
+// ------------------------------------------------------------ согласование
+// Роль приходит заголовком X-Prostor-Actor и НЕ проверяется — см. Actor.cs.
+// Сверка компании ниже нужна для согласованности интерфейса, а не для
+// разграничения доступа: авторизации в прототипе нет.
+
+app.MapPost("/api/v1/tz/documents/{tzId:guid}/assignments", async (
+    Guid tzId, SendRequest body, TzDb db, CancellationToken ct) =>
+{
+    var document = await db.GetDocumentAsync(tzId, ct);
+    if (document is null) return Results.NotFound();
+
+    var companyIds = (body.CompanyIds ?? Array.Empty<string>())
+        .Where(id => !string.IsNullOrWhiteSpace(id))
+        .Distinct()
+        .ToArray();
+
+    if (ReviewRules.ValidateSend(document.Status, companyIds) is { } error)
+        return Results.Json(new { error = error.Code, message = error.Message },
+            jsonOptions, statusCode: StatusCodes.Status422UnprocessableEntity);
+
+    var rootTzId = document.ParentTzId ?? document.TzId;
+    var created = await db.CreateAssignmentsAsync(tzId, rootTzId, companyIds, body.Note, ct);
+
+    foreach (var companyId in companyIds)
+        await db.LogEventAsync("tz_sent", new JsonObject
+        {
+            ["tzId"] = tzId.ToString(),
+            ["companyId"] = companyId
+        }, ct);
+
+    return Results.Json(new
+    {
+        created,
+        items = await db.GetAssignmentsAsync(rootTzId, ct)
+    }, jsonOptions, statusCode: StatusCodes.Status201Created);
+});
+
+// Направления по всей цепочке версий: заказчик видит и то, что уходило на
+// предыдущей версии ТЗ, а не только на текущей.
+app.MapGet("/api/v1/tz/documents/{tzId:guid}/assignments", async (
+    Guid tzId, TzDb db, CancellationToken ct) =>
+{
+    var rootTzId = await db.GetRootTzIdAsync(tzId, ct);
+    if (rootTzId is null) return Results.NotFound();
+    return Results.Json(new
+    {
+        rootTzId,
+        items = await db.GetAssignmentsAsync(rootTzId.Value, ct)
+    }, jsonOptions);
+});
+
+// Входящие ТЗ подрядчика. Компания берётся из актора, а не из query —
+// иначе адрес экрана зависел бы от того, кем ты представился.
+app.MapGet("/api/v1/tz/inbox", async (HttpContext http, TzDb db, CancellationToken ct) =>
+{
+    var actor = Actor.From(http);
+    if (!actor.IsContractor)
+        return Results.Json(new { error = "not_contractor", items = Array.Empty<object>() },
+            jsonOptions, statusCode: StatusCodes.Status400BadRequest);
+
+    return Results.Json(new { items = await db.GetInboxAsync(actor.Id, ct) }, jsonOptions);
+});
+
+// Отметка «открыл ТЗ» — отдельным вызовом, а не побочным эффектом GET.
+app.MapPost("/api/v1/tz/assignments/{assignmentId:guid}/view", async (
+    Guid assignmentId, HttpContext http, TzDb db, CancellationToken ct) =>
+{
+    var assignment = await db.GetAssignmentAsync(assignmentId, ct);
+    if (assignment is null) return Results.NotFound();
+
+    var actor = Actor.From(http);
+    if (actor.IsContractor && actor.Id != assignment.CompanyId) return Results.Forbid();
+
+    if (await db.MarkViewedAsync(assignmentId, ct))
+        await db.LogEventAsync("tz_viewed", new JsonObject
+        {
+            ["tzId"] = assignment.TzId.ToString(),
+            ["companyId"] = assignment.CompanyId
+        }, ct);
+
+    return Results.Ok(new { status = ReviewRules.IsDecided(assignment.Status) ? assignment.Status : "viewed" });
+});
+
+app.MapPost("/api/v1/tz/assignments/{assignmentId:guid}/decision", async (
+    Guid assignmentId, DecisionRequest body, HttpContext http, TzDb db, CancellationToken ct) =>
+{
+    var assignment = await db.GetAssignmentAsync(assignmentId, ct);
+    if (assignment is null) return Results.NotFound();
+
+    var actor = Actor.From(http);
+    if (actor.IsContractor && actor.Id != assignment.CompanyId) return Results.Forbid();
+
+    var text = body.Text?.Trim() ?? "";
+    if (ReviewRules.ValidateDecision(assignment.Status, body.Decision, text) is { } error)
+        return Results.Json(new { error = error.Code, message = error.Message },
+            jsonOptions, statusCode: StatusCodes.Status422UnprocessableEntity);
+
+    var decision = body.Decision!;
+    // Согласование без комментария — нормальный случай, но в ленте вердикт
+    // должен быть виден строкой, а не пустотой.
+    if (text.Length == 0) text = "ТЗ согласовано без замечаний.";
+
+    await db.DecideAsync(assignment, decision, text, ct);
+    await db.LogEventAsync($"tz_{decision}", new JsonObject
+    {
+        ["tzId"] = assignment.TzId.ToString(),
+        ["companyId"] = assignment.CompanyId
+    }, ct);
+
+    return Results.Ok(new { status = decision });
+});
+
+// ------------------------------------------------------------ замечания
+// Тред живёт по корню цепочки версий: правки по замечаниям создают новую
+// версию документа, а обсуждение продолжается то же самое.
+app.MapGet("/api/v1/tz/documents/{tzId:guid}/comments", async (
+    Guid tzId, TzDb db, CancellationToken ct) =>
+{
+    var rootTzId = await db.GetRootTzIdAsync(tzId, ct);
+    if (rootTzId is null) return Results.NotFound();
+    return Results.Json(new
+    {
+        rootTzId,
+        items = await db.GetCommentsAsync(rootTzId.Value, ct)
+    }, jsonOptions);
+});
+
+app.MapPost("/api/v1/tz/documents/{tzId:guid}/comments", async (
+    Guid tzId, CommentRequest body, HttpContext http, TzDb db, CancellationToken ct) =>
+{
+    var rootTzId = await db.GetRootTzIdAsync(tzId, ct);
+    if (rootTzId is null) return Results.NotFound();
+
+    var text = body.Text?.Trim() ?? "";
+    if (text.Length == 0)
+        return Results.Json(new { error = "empty_comment", message = "Замечание не может быть пустым." },
+            jsonOptions, statusCode: StatusCodes.Status422UnprocessableEntity);
+
+    var actor = Actor.From(http);
+    var sectionKey = string.IsNullOrWhiteSpace(body.SectionKey) ? null : body.SectionKey.Trim();
+    await db.AddCommentAsync(rootTzId.Value, tzId, body.AssignmentId, actor, sectionKey, text, ct);
+
+    return Results.Json(new { items = await db.GetCommentsAsync(rootTzId.Value, ct) },
+        jsonOptions, statusCode: StatusCodes.Status201Created);
 });
 
 app.Run();
@@ -263,3 +434,9 @@ public sealed record DraftRequest(Guid? SessionId, string? TemplateId, JsonObjec
 public sealed record DocumentRequest(
     Guid? SessionId, string? TemplateId, JsonObject? State, bool? Force, Guid? ParentTzId,
     bool? AsDraft);
+
+public sealed record SendRequest(string[]? CompanyIds, string? Note);
+
+public sealed record DecisionRequest(string? Decision, string? Text);
+
+public sealed record CommentRequest(string? SectionKey, string? Text, Guid? AssignmentId);

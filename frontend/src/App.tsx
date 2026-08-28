@@ -1,9 +1,12 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { ChatView } from './ChatView'
 import { ConstructorView } from './ConstructorView'
 import { AnalyticsView } from './AnalyticsView'
 import { DocumentsView } from './DocumentsView'
+import { ContractorInboxView } from './ContractorInboxView'
+import { getCompanies, type CompanyRef } from './api'
+import { CUSTOMER, setActor, useActor } from './identity'
 
 type Tab = 'chat' | 'constructor' | 'documents' | 'analytics'
 
@@ -72,25 +75,63 @@ const TABS: { key: Tab; label: string; short: string; crumb: string; icon: React
 ]
 
 export default function App() {
+  // Роль — переключатель демо-контекста, а не авторизация: логинов и паролей
+  // в прототипе нет, см. identity.ts. Заказчик один (НТЦ), подрядчиков много —
+  // это компании из catalog.company.
+  const actor = useActor()
+  const isContractor = actor.kind === 'contractor'
+  const [companies, setCompanies] = useState<CompanyRef[]>([])
+
   const [tab, setTab] = useState<Tab>('chat')
   const [sessionId, setSessionId] = useState<string | null>(null)
-  const [editTzId, setEditTzId] = useState<string | null>(null)
+  // Не просто id, а «запрос на открытие»: конструктор теперь остаётся
+  // смонтированным, и повторный клик по тому же ТЗ должен снова его загрузить.
+  const [editRequest, setEditRequest] =
+    useState<{ tzId: string; at: number; sectionKey?: string } | null>(null)
+  const [chatRequest, setChatRequest] = useState<{ sessionId: string; at: number } | null>(null)
+  // Документ, на котором нужно открыть «Мои заявки»: после формирования ТЗ
+  // пользователь попадает сразу на свой свежий документ, а не в общий список,
+  // где его ещё надо найти глазами.
+  const [focusTzId, setFocusTzId] = useState<string | null>(null)
+  // Факт «в конструкторе сформировали ТЗ», переданный в чат: он отмечает его
+  // отдельным ходом, поэтому нужен не только id, но и момент — иначе повторная
+  // генерация того же документа не отличалась бы от предыдущей.
+  const [documentCreated, setDocumentCreated] = useState<{ tzId: string; at: number } | null>(null)
+  // Счётчик сбросов заявки. Конструктор больше не размонтируется при
+  // переключении вкладок, поэтому «Начать заново» в чате обязано дотянуться
+  // до него сигналом — иначе форма осталась бы заполненной данными старой
+  // заявки, хотя localStorage уже очищен.
+  const [resetToken, setResetToken] = useState(0)
 
   // Единое приложение с общей навигацией: переход из чата в конструктор
   // передаёт идентификатор сессии, а вместе с ним — все данные диалога.
   const openConstructor = (id: string) => {
     setSessionId(id)
-    setEditTzId(null)
+    setEditRequest(null)
+    // Именно запрос, а не просто id: конструктор смонтирован всегда, и перенос
+    // данных диалога в форму должен происходить по клику, а не при старте.
+    setChatRequest({ sessionId: id, at: Date.now() })
     setTab('constructor')
   }
 
   // Открытие ранее сохранённого ТЗ из «Мои заявки» — в отличие от
   // openConstructor, тут нет sessionId, конструктор грузит state по
   // editTzId напрямую из БД.
-  const openTzInConstructor = (tzId: string) => {
-    setEditTzId(tzId)
+  // sectionKey приходит из замечания подрядчика: конструктор откроется не
+  // просто на этом ТЗ, а на разделе, к которому есть претензия.
+  const openTzInConstructor = (tzId: string, sectionKey?: string) => {
+    setEditRequest({ tzId, at: Date.now(), sectionKey })
     setTab('constructor')
   }
+
+  const openDocuments = (tzId?: string) => {
+    setFocusTzId(tzId ?? null)
+    setTab('documents')
+  }
+
+  useEffect(() => {
+    getCompanies().then((r) => setCompanies(r.items ?? [])).catch(() => undefined)
+  }, [])
 
   const active = TABS.find((t) => t.key === tab) ?? TABS[0]
 
@@ -107,24 +148,55 @@ export default function App() {
               верхние вкладки там скрыты, и без подписи было бы непонятно, где ты. */}
           <div className="crumbs">
             <span className="sep">›</span>
-            <span>{active.crumb}</span>
+            <span>{isContractor ? 'Входящие ТЗ' : active.crumb}</span>
           </div>
         </div>
 
-        <nav className="topbar-nav">
-          {TABS.map((t) => (
-            <button key={t.key} className={tab === t.key ? 'on' : ''} onClick={() => setTab(t.key)}>
-              {t.label}
-            </button>
-          ))}
-        </nav>
+        {/* Под ролью подрядчика раздел один — входящие ТЗ, и навигация
+            вырождается в подпись. Показывать её не за что. */}
+        {!isContractor && (
+          <nav className="topbar-nav">
+            {TABS.map((t) => (
+              <button key={t.key} className={tab === t.key ? 'on' : ''} onClick={() => setTab(t.key)}>
+                {t.label}
+              </button>
+            ))}
+          </nav>
+        )}
 
-        {/* Правый блок шапки: только контекст организации. Профиля и роли нет —
-            авторизация в системе не предусмотрена, показывать имя пользователя
-            было бы обещанием функции, которой не существует. */}
+        {/* Правый блок шапки: кто сейчас работает с системой. Это демо-роль,
+            а не учётная запись — логина и пароля в прототипе нет, роль лежит
+            в localStorage и уходит на бэкенд заголовком (см. identity.ts). */}
         <div className="topbar-right">
-          <select className="top-select" defaultValue="ntc" aria-label="Организация">
-            <option value="ntc">НТЦ</option>
+          <select
+            className="top-select"
+            value={actor.kind === 'customer' ? 'ntc' : actor.id}
+            aria-label="Роль"
+            onChange={(e) => {
+              const value = e.target.value
+              if (value === 'ntc') {
+                setActor(CUSTOMER)
+                return
+              }
+              const company = companies.find((c) => c.companyId === value)
+              if (company) {
+                setActor({
+                  kind: 'contractor',
+                  id: company.companyId,
+                  name: company.name,
+                  code: company.code,
+                })
+              }
+            }}
+          >
+            <optgroup label="Заказчик">
+              <option value="ntc">НТЦ</option>
+            </optgroup>
+            <optgroup label="Подрядчик">
+              {companies.map((c) => (
+                <option key={c.companyId} value={c.companyId}>{c.name}</option>
+              ))}
+            </optgroup>
           </select>
         </div>
       </header>
@@ -138,22 +210,54 @@ export default function App() {
           переключение без сети; восстановление после полной перезагрузки страницы
           отдельно решено в ChatView через localStorage + GET /sessions/{id}.
         */}
-        <div hidden={tab !== 'chat'}>
-          <ChatView onOpenConstructor={openConstructor} onResetSession={() => setSessionId(null)} />
+        <div hidden={isContractor || tab !== 'chat'}>
+          <ChatView
+            onOpenConstructor={openConstructor}
+            onOpenDocuments={openDocuments}
+            onResetSession={() => {
+              setSessionId(null)
+              setDocumentCreated(null)
+              setEditRequest(null)
+              setChatRequest(null)
+              setFocusTzId(null)
+              setResetToken((n) => n + 1)
+            }}
+            documentCreated={documentCreated}
+          />
         </div>
-        {tab === 'constructor' && (
+        {/*
+          Конструктор, как и чат, остаётся смонтированным: при conditional
+          render он терял всё несохранённое состояние на каждом переключении
+          вкладки — зону готового документа, замечания ИИ, а в режиме
+          редактирования ещё и перечитывал ТЗ из БД поверх правок пользователя.
+        */}
+        <div hidden={isContractor || tab !== 'constructor'}>
           <ConstructorView
             sessionId={sessionId}
-            editTzId={editTzId}
-            onNavigateToDocuments={() => setTab('documents')}
+            editRequest={editRequest}
+            chatRequest={chatRequest}
+            resetToken={resetToken}
+            onNavigateToDocuments={openDocuments}
+            onDocumentCreated={(tzId) => setDocumentCreated({ tzId, at: Date.now() })}
           />
+        </div>
+        {!isContractor && tab === 'documents' && (
+          <DocumentsView onOpenInConstructor={openTzInConstructor} focusTzId={focusTzId} />
         )}
-        {tab === 'documents' && <DocumentsView onOpenInConstructor={openTzInConstructor} />}
-        {tab === 'analytics' && <AnalyticsView />}
+        {!isContractor && tab === 'analytics' && <AnalyticsView />}
+        {/* Экран подрядчика. Чат и конструктор выше остаются смонтированными
+            и под этой ролью: примерка роли подрядчика не должна стирать
+            диалог и форму заказчика — вернувшись, он продолжит с того места,
+            где остановился. */}
+        {isContractor && <ContractorInboxView actor={actor} />}
       </main>
 
       {/* Нижняя панель вкладок — только для телефонов, на десктопе скрыта в CSS.
-          Переключает то же самое состояние tab, что и вкладки в шапке. */}
+          Переключает то же самое состояние tab, что и вкладки в шапке.
+          Под ролью подрядчика раздел один, переключать нечего. */}
+      {/* Именно условный рендер, а не hidden: у .tabbar в CSS стоит
+          display: grid, который перебивает атрибут hidden. */}
+      {!isContractor && (
       <nav className="tabbar" aria-label="Разделы">
         {TABS.map((t) => (
           <button
@@ -167,6 +271,7 @@ export default function App() {
           </button>
         ))}
       </nav>
+      )}
     </div>
   )
 }

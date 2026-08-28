@@ -3,6 +3,8 @@
 // сервер стримит события хода (delta/block/state/done) кадрами по мере
 // готовности, а не одним ответом в конце.
 
+import { actorHeaders } from './identity'
+
 export type BlockItem = Record<string, any>
 
 export interface Block {
@@ -18,11 +20,17 @@ export interface ChatStateSnapshot {
   missing: string[]
   productId?: string
   productName?: string
+  productCategory?: string
   templateId?: string
   period?: { from?: string; to?: string }
   stages: number
   executors: number
+  executorNames?: string[]
   tzId?: string
+  // Поля ТЗ, собранные из разговора: приходят в каждом снапшоте состояния,
+  // чтобы панель заявки показывала их сразу, а не после открытия конструктора.
+  fields?: Record<string, string>
+  flags?: string[]
 }
 
 export interface TurnAction {
@@ -190,7 +198,11 @@ export async function createTzDocument(
 }
 
 export async function listTzDocuments() {
-  const response = await fetch('/api/v1/tz/documents?limit=20')
+  // Не 20: «Мои заявки» раскладывают документы по категориям и показывают
+  // счётчики, а счётчик по обрезанному списку врёт — согласованное ТЗ месячной
+  // давности просто не попало бы в свою категорию. Для прототипа с десятками
+  // документов один запрос дешевле пагинации.
+  const response = await fetch('/api/v1/tz/documents?limit=200')
   return response.json()
 }
 
@@ -209,6 +221,16 @@ export interface TzVersionItem {
   objectName: string
   status: 'draft' | 'final'
   downloadUrl: string
+  pdfUrl: string
+}
+
+/**
+ * Ссылка на файл документа. PDF — то же самое ТЗ, собранное на лету из
+ * сохранённого payload (в хранилище лежит только .docx), поэтому это один
+ * эндпойнт с параметром формата, а не два разных адреса.
+ */
+export function documentFileUrl(tzId: string, format: 'docx' | 'pdf' = 'docx'): string {
+  return `/api/v1/tz/documents/${tzId}/file${format === 'pdf' ? '?format=pdf' : ''}`
 }
 
 export async function getTzDocumentVersions(tzId: string): Promise<{ rootTzId: string; items: TzVersionItem[] }> {
@@ -263,5 +285,144 @@ export async function getProductRisks(productId: string): Promise<{ items: Produ
 
 export async function getAnalytics() {
   const response = await fetch('/api/v1/analytics/overview')
+  return response.json()
+}
+
+// ------------------------------------------------------------ согласование
+// Роль уходит заголовком X-Prostor-Actor. Это демо-контекст, а не
+// авторизация: бэкенд принимает заголовок на веру (см. identity.ts).
+
+export interface CompanyRef {
+  companyId: string
+  code: string
+  name: string
+  rating: number
+}
+
+export async function getCompanies(): Promise<{ items: CompanyRef[] }> {
+  const response = await fetch('/api/v1/catalog/companies')
+  if (!response.ok) return { items: [] }
+  return response.json()
+}
+
+export type ReviewStatus = 'sent' | 'viewed' | 'approved' | 'revision' | 'rejected'
+
+export interface Assignment {
+  assignmentId: string
+  tzId: string
+  version: number
+  companyId: string
+  companyName: string
+  companyCode: string
+  status: ReviewStatus
+  note?: string | null
+  createdAt: string
+  viewedAt?: string | null
+  decidedAt?: string | null
+}
+
+export interface InboxItem {
+  assignmentId: string
+  tzId: string
+  rootTzId: string
+  status: ReviewStatus
+  note?: string | null
+  createdAt: string
+  viewedAt?: string | null
+  decidedAt?: string | null
+  version: number
+  readiness: number
+  templateName: string
+  productName: string
+  objectName: string
+  customerName: string
+  commentsCount: number
+}
+
+export interface ReviewComment {
+  commentId: string
+  tzId: string
+  assignmentId?: string | null
+  authorKind: 'customer' | 'contractor'
+  authorId: string
+  authorName: string
+  sectionKey?: string | null
+  kind: 'comment' | 'decision'
+  decision?: ReviewStatus | null
+  text: string
+  createdAt: string
+}
+
+export async function sendToContractors(
+  tzId: string,
+  companyIds: string[],
+  note?: string,
+): Promise<{ ok: boolean; body: any }> {
+  const response = await fetch(`/api/v1/tz/documents/${tzId}/assignments`, {
+    method: 'POST',
+    headers: { ...json, ...actorHeaders() },
+    body: JSON.stringify({ companyIds, note: note ?? null }),
+  })
+  return { ok: response.ok, body: await response.json() }
+}
+
+export async function getAssignments(tzId: string): Promise<{ items: Assignment[] }> {
+  const response = await fetch(`/api/v1/tz/documents/${tzId}/assignments`, {
+    headers: actorHeaders(),
+  })
+  if (!response.ok) return { items: [] }
+  return response.json()
+}
+
+export async function getInbox(): Promise<{ items: InboxItem[] }> {
+  const response = await fetch('/api/v1/tz/inbox', { headers: actorHeaders() })
+  if (!response.ok) return { items: [] }
+  return response.json()
+}
+
+export async function markAssignmentViewed(assignmentId: string): Promise<void> {
+  await fetch(`/api/v1/tz/assignments/${assignmentId}/view`, {
+    method: 'POST',
+    headers: actorHeaders(),
+  })
+}
+
+export async function decideAssignment(
+  assignmentId: string,
+  decision: 'approved' | 'revision' | 'rejected',
+  text: string,
+): Promise<{ ok: boolean; body: any }> {
+  const response = await fetch(`/api/v1/tz/assignments/${assignmentId}/decision`, {
+    method: 'POST',
+    headers: { ...json, ...actorHeaders() },
+    body: JSON.stringify({ decision, text }),
+  })
+  return { ok: response.ok, body: await response.json() }
+}
+
+export async function getComments(tzId: string): Promise<{ items: ReviewComment[] }> {
+  const response = await fetch(`/api/v1/tz/documents/${tzId}/comments`, {
+    headers: actorHeaders(),
+  })
+  if (!response.ok) return { items: [] }
+  return response.json()
+}
+
+export async function addComment(
+  tzId: string,
+  text: string,
+  sectionKey?: string | null,
+  assignmentId?: string | null,
+): Promise<{ items: ReviewComment[] }> {
+  const response = await fetch(`/api/v1/tz/documents/${tzId}/comments`, {
+    method: 'POST',
+    headers: { ...json, ...actorHeaders() },
+    body: JSON.stringify({
+      text,
+      sectionKey: sectionKey ?? null,
+      assignmentId: assignmentId ?? null,
+    }),
+  })
+  if (!response.ok) return { items: [] }
   return response.json()
 }

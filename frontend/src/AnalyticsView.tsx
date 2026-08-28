@@ -12,6 +12,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { severityLabel } from './Blocks'
 import { getAnalytics, listTzDocuments } from './api'
 
 interface Overview {
@@ -32,6 +33,16 @@ interface Overview {
   }[]
   requestsByDay: { day: string; recognized: number; unrecognized: number }[]
   tzByDay: { day: string; cnt: number }[]
+  // Появляется только когда накачена миграция 08_review.sql — до неё
+  // раздела согласования на дашборде просто нет.
+  review?: {
+    sent: number
+    pending: number
+    approved: number
+    revision: number
+    rejected: number
+    avgDecisionHours: number
+  }
 }
 
 // Палитра для секторов диаграммы: производные от фирменных синего #004596 и
@@ -102,6 +113,12 @@ export function AnalyticsView() {
         <Kpi label="Распознано" value={`${recognizedShare}%`} />
         <Kpi label="Создано ТЗ" value={data.tzCreated} />
         <Kpi label="Средняя готовность" value={`${data.tzAvgReadiness}%`} />
+        {data.review && data.review.sent > 0 && (
+          <>
+            <Kpi label="Направлено подрядчикам" value={data.review.sent} />
+            <Kpi label="Согласовано" value={data.review.approved} />
+          </>
+        )}
       </div>
 
       <div className="grid">
@@ -198,6 +215,25 @@ export function AnalyticsView() {
           )}
         </Panel>
 
+        {data.review && data.review.sent > 0 && (
+          <Panel title="Согласование ТЗ подрядчиками">
+            <Bars
+              rows={[
+                { label: 'Ждут ответа', value: data.review.pending },
+                { label: 'Согласовано', value: data.review.approved },
+                { label: 'На доработке', value: data.review.revision },
+                { label: 'Отклонено', value: data.review.rejected },
+              ]}
+              max={data.review.sent}
+            />
+            <p className="muted small">
+              Всего направлений: {data.review.sent}
+              {data.review.avgDecisionHours > 0 &&
+                ` · среднее время до решения: ${data.review.avgDecisionHours} ч`}
+            </p>
+          </Panel>
+        )}
+
         <Panel title="Исполнители с наибольшим числом аналогичных работ">
           <Bars rows={data.topExecutors.map((r) => ({ label: `${r.name} · ${r.products} услуг`, value: r.works }))}
                 max={max(data.topExecutors, 'works')} />
@@ -218,11 +254,12 @@ export function AnalyticsView() {
           {data.topRisks.length === 0 ? (
             <p className="muted">Пока нет данных — сформируйте несколько ТЗ</p>
           ) : (
-            <ul className="plain">
+            <ul className="risks risk-stats">
               {data.topRisks.map((risk, i) => (
-                <li key={i}>
-                  <span className={`sev ${risk.severity}`}>{risk.severity}</span> {risk.title}
-                  <span className="muted"> · {risk.cnt}</span>
+                <li key={i} className={`risk ${risk.severity}`}>
+                  <span className="sev">{severityLabel(risk.severity)}</span>
+                  <span className="risk-stat-title">{risk.title}</span>
+                  <span className="risk-stat-count">{risk.cnt}</span>
                 </li>
               ))}
             </ul>
@@ -238,8 +275,14 @@ export function AnalyticsView() {
           )}
         </Panel>
 
-        <Panel title="Кандидаты на упаковку в типовой продукт">
+        <Panel title="Кандидаты на упаковку в типовой продукт" wide>
           <table className="mini">
+            <colgroup>
+              <col style={{ width: '40%' }} />
+              <col style={{ width: '15%' }} />
+              <col style={{ width: '22%' }} />
+              <col style={{ width: '23%' }} />
+            </colgroup>
             <thead>
               <tr><th>Услуга</th><th>Работ</th><th>Исполнителей</th><th>Типовой срок</th></tr>
             </thead>
@@ -268,11 +311,18 @@ export function AnalyticsView() {
           )}
         </Panel>
 
-        <Panel title="Последние созданные ТЗ">
+        <Panel title="Последние созданные ТЗ" wide>
           {documents.length === 0 ? (
             <p className="muted">ТЗ пока не создавались</p>
           ) : (
             <table className="mini">
+              <colgroup>
+                <col style={{ width: '30%' }} />
+                <col style={{ width: '32%' }} />
+                <col style={{ width: '16%' }} />
+                <col style={{ width: '11%' }} />
+                <col style={{ width: '11%' }} />
+              </colgroup>
               <thead>
                 <tr><th>Услуга</th><th>Объект</th><th>Готовность</th><th>Рисков</th><th /></tr>
               </thead>
