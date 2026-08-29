@@ -66,8 +66,9 @@ public sealed class AppConfig
     // само по себе мало что значит. Поэтому решение принимается по трём
     // сигналам сразу (TurnPipeline.Assess): абсолютный уровень, наличие
     // доказательств (matched_terms) и отрыв лидера от остальной выдачи.
-    // Замеры на реальном каталоге: точный запрос ~0.64, запрос с опечаткой,
-    // но по адресу ~0.63, шум из услуг-дубликатов ~0.12–0.33.
+    // Замеры на реальном каталоге после переноса веса на вектор: точный запрос
+    // ~0.69, осмысленный запрос своими словами ~0.55, шум и запрос с опечаткой,
+    // по которому ничего не нашлось, ~0.35–0.38.
 
     /// <summary>Ниже этого — «ничего не нашлось», карточки не показываем вовсе.</summary>
     public decimal SearchMinScore { get; init; } = 0.20m;
@@ -76,11 +77,16 @@ public sealed class AppConfig
     public decimal SearchConfidentScore { get; init; } = 0.45m;
 
     /// <summary>
-    /// Насколько лидер должен оторваться от второго места. Плоская выдача —
-    /// признак шума: ровно так выглядели пять юридических услуг-дубликатов,
-    /// набравших одинаковый балл на запрос про бурение.
+    /// Насколько лидер должен оторваться от второго места. Планка снижена
+    /// вместе с переносом веса на семантический канал (db/init/04_functions.sql):
+    /// score теперь на три четверти состоит из косинусной близости, а она у
+    /// нескольких профильных услуг закономерно похожа — отрыв в 0.08 стал
+    /// недостижим, и уверенная выдача уходила в «догадку» даже когда наверху
+    /// стояла ровно та услуга, о которой спрашивали. Проверку на шум держат
+    /// SearchConfidentScore и SearchSemanticFloor; здесь остаётся защита от
+    /// действительно плоской выдачи — совпадения балл в балл у дубликатов.
     /// </summary>
-    public decimal SearchMinMargin { get; init; } = 0.08m;
+    public decimal SearchMinMargin { get; init; } = 0.005m;
 
     /// <summary>
     /// Планка близости, когда лексических доказательств нет совсем
@@ -141,7 +147,7 @@ public sealed class AppConfig
 
             SearchMinScore       = GetDecimal("SEARCH_MIN_SCORE", 0.20m),
             SearchConfidentScore = GetDecimal("SEARCH_CONFIDENT_SCORE", 0.45m),
-            SearchMinMargin      = GetDecimal("SEARCH_MIN_MARGIN", 0.08m),
+            SearchMinMargin      = GetDecimal("SEARCH_MIN_MARGIN", 0.005m),
             SearchSemanticFloor  = GetDecimal("SEARCH_SEMANTIC_FLOOR", 0.60m),
 
             TopProducts = GetInt("TOP_PRODUCTS", 5),

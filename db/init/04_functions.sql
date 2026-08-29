@@ -91,6 +91,28 @@ q AS (
            websearch_to_tsquery('russian', coalesce(p_query, ''))               AS tsq_all,
            upper(btrim(coalesce(p_query, '')))                                  AS raw
 ),
+w AS (
+    -- Приоритет каналов. Основной сигнал — семантическая близость: запрос
+    -- пользователь формулирует своими словами, а не словами каталога, поэтому
+    -- совпадение слов только уточняет порядок внутри смыслово близких услуг и
+    -- больше не решает исход. Прежний набор (вектор 0.40 против 0.45 на двух
+    -- лексических каналах плюс 0.15 за точную фразу) выводил наверх услугу,
+    -- у которой просто чаще встречается слово запроса.
+    --
+    -- Когда эмбеддинга нет (модель недоступна — TurnPipeline.EmbedAsync отдаёт
+    -- NULL), веса остаются прежними, дорефактовыми: понижать лексику там,
+    -- где она единственный работающий канал, нечем — вся выдача просела бы
+    -- ниже порогов уверенности и сервис отвечал бы «ничего не нашлось»
+    -- вместо честного текстового подбора. Пороги в AppConfig калибруются
+    -- по основному режиму, поэтому деградированная ветка обязана сохранить
+    -- прежний масштаб балла, а не получить свой собственный.
+    SELECT CASE WHEN p_emb IS NULL THEN 0.00 ELSE 0.75 END AS w_vec,
+           CASE WHEN p_emb IS NULL THEN 0.20 ELSE 0.04 END AS w_fts,
+           CASE WHEN p_emb IS NULL THEN 0.25 ELSE 0.07 END AS w_cfts,
+           CASE WHEN p_emb IS NULL THEN 0.10 ELSE 0.03 END AS w_trg,
+           CASE WHEN p_emb IS NULL THEN 0.05 ELSE 0.03 END AS w_pop,
+           CASE WHEN p_emb IS NULL THEN 0.15 ELSE 0.04 END AS w_phrase
+),
 chunk_df AS (
     -- Насколько чанк вообще различает услуги. В выгрузке десятки услуг делят
     -- дословно одинаковый текст операций («Помощь в формировании/получении
@@ -192,16 +214,19 @@ scored AS (
            round(coalesce(s.popularity_norm, 0), 4)                 AS popularity,
            round((
                  -- вклад вектора гасится, если ближайший чанк не различает услуги
-                 0.40 * (1 - coalesce(v.dist, 1)) * coalesce(v.disc, 1)
-               + 0.20 * least(coalesce(f.lex, 0)  / 0.4, 1)
-               + 0.25 * least(coalesce(cf.clex, 0) / 0.4, 1) * coalesce(cf.disc, 1)
-               -- опечатки: полноценный канал вместо прежнего округления 0.05
-               + 0.10 * least(coalesce(t.sim, 0), 1)
-               -- популярность понижена с 0.10: это тай-брейк при прочих равных,
+                 wg.w_vec * (1 - coalesce(v.dist, 1)) * coalesce(v.disc, 1)
+               + wg.w_fts * least(coalesce(f.lex, 0)  / 0.4, 1)
+               + wg.w_cfts * least(coalesce(cf.clex, 0) / 0.4, 1) * coalesce(cf.disc, 1)
+               -- опечатки: тот же лексический по природе канал, поэтому вес
+               -- снижен вместе с остальными совпадениями по словам
+               + wg.w_trg * least(coalesce(t.sim, 0), 1)
+               -- популярность: тай-брейк при прочих равных,
                -- она не должна вытягивать нерелевантное наверх
-               + 0.05 * coalesce(s.popularity_norm, 0)
+               + wg.w_pop * coalesce(s.popularity_norm, 0)
                + CASE WHEN (SELECT tsq_all FROM q) IS NOT NULL
-                       AND p.search_tsv @@ (SELECT tsq_all FROM q) THEN 0.15 ELSE 0 END
+                       AND p.search_tsv @@ (SELECT tsq_all FROM q) THEN wg.w_phrase ELSE 0 END
+               -- дословное совпадение названия остаётся вне весов: это не
+               -- «похоже по словам», а прямое указание услуги по имени
                + CASE WHEN upper(p.name) = (SELECT raw FROM q) THEN 1.0 ELSE 0 END
            )::numeric, 4)                                           AS score,
            coalesce(m.terms, ARRAY[]::text[])                       AS matched_terms,
@@ -213,6 +238,7 @@ scored AS (
            (SELECT t2.template_id FROM tz.template t2
              WHERE p.product_id = ANY (t2.product_ids) LIMIT 1)     AS template_id
     FROM cand c
+    CROSS JOIN w wg
     JOIN catalog.product p ON p.product_id = c.product_id AND p.is_active
     LEFT JOIN vec     v  ON v.product_id  = c.product_id
     LEFT JOIN fts     f  ON f.product_id  = c.product_id
@@ -276,6 +302,14 @@ WITH q AS (
     SELECT p_emb AS emb,
            (SELECT string_agg(quote_literal(lexeme), ' | ')
               FROM unnest(to_tsvector('russian', coalesce(p_query, ''))))::tsquery AS tsq
+),
+w AS (
+    -- Тот же приоритет, что и в подборе услуг: решает смысловая близость
+    -- профиля компании, а не то, сколько слов запроса дословно встретилось
+    -- в её описании. Без эмбеддинга вес вектора уходит лексическим каналам.
+    SELECT CASE WHEN p_emb IS NULL THEN 0.00 ELSE 0.62 END AS w_vec,
+           CASE WHEN p_emb IS NULL THEN 0.30 ELSE 0.06 END AS w_fts,
+           CASE WHEN p_emb IS NULL THEN 0.10 ELSE 0.03 END AS w_trg
 ),
 qlex AS (
     SELECT DISTINCT lexeme
@@ -356,9 +390,9 @@ scored AS (
            round((1 - coalesce(v.dist, 1))::numeric, 4)                  AS similarity,
            round(coalesce(f.lex, 0)::numeric, 4)                         AS lexical,
            round((
-                 0.35 * (1 - coalesce(v.dist, 1))
-               + 0.30 * least(coalesce(f.lex, 0) / 0.4, 1)
-               + 0.10 * least(coalesce(t.sim, 0), 1)
+                 wg.w_vec * (1 - coalesce(v.dist, 1))
+               + wg.w_fts * least(coalesce(f.lex, 0) / 0.4, 1)
+               + wg.w_trg * least(coalesce(t.sim, 0), 1)
                -- подтверждённый опыт: логарифм, чтобы один крупный подрядчик
                -- не забивал выдачу только объёмом истории
                + 0.15 * least(ln(1 + coalesce(h.calcs_cnt, 0)) / ln(30), 1)
@@ -371,6 +405,7 @@ scored AS (
            coalesce(h.top_products, ARRAY[]::text[])                     AS top_products,
            left(coalesce(v.chunk_text, pr.profile_text), 220)            AS snippet
     FROM cand c
+    CROSS JOIN w wg
     JOIN prof pr ON pr.company_id = c.company_id
     LEFT JOIN vec     v ON v.company_id = c.company_id
     LEFT JOIN fts     f ON f.company_id = c.company_id
