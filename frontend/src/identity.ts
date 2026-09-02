@@ -30,9 +30,26 @@ export interface ContractorActor {
   code: string
 }
 
-export type Actor = CustomerActor | ContractorActor
+/**
+ * Администратор платформы. Заказчик видит аналитику и заявки только по своей
+ * работе, а сводная картина по всем документам — материалы владельца
+ * платформы, а не одного из её пользователей. Заказчик сегодня один, поэтому
+ * фильтрации по заказчику ещё нет — разделены именно наборы показателей.
+ */
+export interface AdminActor {
+  kind: 'admin'
+  id: 'admin'
+  name: string
+  code: string
+}
+
+export type Actor = CustomerActor | ContractorActor | AdminActor
 
 export const CUSTOMER: CustomerActor = { kind: 'customer', id: 'ntc', name: 'НТЦ', code: 'НТЦ' }
+
+export const ADMIN: AdminActor = {
+  kind: 'admin', id: 'admin', name: 'Администратор платформы', code: 'Админ',
+}
 
 const ACTOR_KEY = 'prostor.actor'
 
@@ -49,6 +66,7 @@ function read(): Actor {
     if (!raw) return CUSTOMER
     const parsed = JSON.parse(raw) as Actor
     if (parsed?.kind === 'contractor' && parsed.id) return parsed
+    if (parsed?.kind === 'admin') return ADMIN
     return CUSTOMER
   } catch {
     return CUSTOMER

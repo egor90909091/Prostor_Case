@@ -83,6 +83,14 @@ public sealed class TurnPipeline
         stages = state.Stages.Count,
         executors = state.Executors.Count,
         executorNames = state.Executors.Select(e => e.Name).ToList(),
+        // Идентификаторы выбранного, а не только счётчики: по ним карточка в
+        // ленте диалога отмечает выбранное — где бы в истории она ни стояла и
+        // как бы выбор ни был сделан, кликом или словами. Иначе выбор виден
+        // только в боковой панели, а карточка рядом с репликой выглядит
+        // нетронутой (см. Blocks.tsx, useAppliedSelection).
+        stageIds = state.Stages.Select(s => s.Key).ToList(),
+        executorIds = state.Executors.Select(e => e.Id).ToList(),
+        operationIds = state.OperationIds.ToList(),
         tzId = state.TzId,
         // Собранные из разговора поля ТЗ едут в снапшот, чтобы боковая панель
         // показывала их сразу же: человек видит, что именно услышал ассистент,
@@ -146,9 +154,10 @@ public sealed class TurnPipeline
 
         var offer = decision.Offer;
 
-        // Сроки, названные словами, уже привели к списку исполнителей внутри
-        // ApplyFactsAsync — предлагать что-то ещё в этом же ходу незачем.
-        if (captured.Any(c => c.Key == "period")) offer = Offer.None;
+        // Сроки и этапы, названные словами, уже привели к следующей карточке
+        // внутри ApplyFactsAsync (список исполнителей, готовность ТЗ) —
+        // предлагать что-то ещё в этом же ходу незачем.
+        if (captured.Any(c => c.Key is "period" or "stages")) offer = Offer.None;
 
         switch (decision.Intent)
         {
@@ -310,6 +319,29 @@ public sealed class TurnPipeline
             }
         }
 
+        // Этапы, названные словами («давай этап 1 Уточнение и этап 1 Экспертиза»), —
+        // тот же путь, что и галочки в карточке: модель называет только номера
+        // из показанного списка, ключи подставляет код. Прежде такого пути не
+        // было вовсе, и названия этапов оседали текстом в «особых условиях», а
+        // в карточке не отмечались — выбор словами выглядел непринятым.
+        var named = ResolveStages(state, facts.StageNumbers);
+        if (named.Count > 0)
+        {
+            // Добавление, а не замена: модель присылает только то, что прозвучало
+            // сейчас, а уже выбранное она видит в состоянии заявки. Снять этап
+            // по-прежнему можно галочкой — там выбор задаётся целиком.
+            var keys = state.Stages.Select(s => s.Key)
+                .Concat(named.Select(s => s.Id))
+                .Distinct()
+                .ToList();
+            if (keys.Count != state.Stages.Count)
+            {
+                captured.Add(new KeyValuePair<string, string>(
+                    "stages", string.Join("; ", named.Select(s => s.Title))));
+                await SelectStagesAsync(sessionId, state, new TurnAction { Ids = keys }, blocks, ct);
+            }
+        }
+
         if (captured.Count > 0)
         {
             await _db.LogEventAsync(sessionId, "facts_captured",
@@ -405,6 +437,20 @@ public sealed class TurnPipeline
         return i >= 0 && i < state.LastOptions.Count ? state.LastOptions[i].Id : null;
     }
 
+    /// <summary>Номера этапов из последнего показанного списка -> сами этапы.</summary>
+    private static List<OptionRef> ResolveStages(ChatState state, IReadOnlyList<int> numbers)
+    {
+        var picked = new List<OptionRef>();
+        foreach (var number in numbers)
+        {
+            var i = number - 1;
+            if (i < 0 || i >= state.LastStages.Count) continue;
+            var option = state.LastStages[i];
+            if (picked.All(p => p.Id != option.Id)) picked.Add(option);
+        }
+        return picked;
+    }
+
     private static void ResetState(ChatState state)
     {
         state.ResetFrom("product");
@@ -414,6 +460,7 @@ public sealed class TurnPipeline
         state.TemplateId = null;
         state.TypicalDays = null;
         state.LastOptions.Clear();
+        state.LastStages.Clear();
         state.LastOffer = null;
         state.StepName = Step.Idle;
     }
@@ -521,7 +568,8 @@ public sealed class TurnPipeline
         var confidence = Assess(hits);
 
         // recognized — это «агент понял запрос», а не «SQL что-то вернул»:
-        // иначе витрина нераспознанных запросов всегда пустая.
+        // иначе доля распознанных запросов в аналитике равна 100 % при любом
+        // качестве поиска.
         await _db.LogSearchAsync(sessionId, text, hits.FirstOrDefault()?.ProductId,
             hits.FirstOrDefault()?.Score, hits.Count,
             recognized: confidence == Confidence.Confident, ct);
@@ -1320,6 +1368,14 @@ public sealed class TurnPipeline
     private static Block StageListBlock(List<StageInfo> stages, ChatState state)
     {
         var chosen = state.Stages.Select(s => s.Key).ToHashSet();
+
+        // Список запоминается там же, где строится: нумерация в промпте модели
+        // и порядок пунктов на экране обязаны совпадать, иначе «выбери этап 3»
+        // отметило бы не тот этап. Отдельным вызовом рядом они бы разъехались.
+        state.LastStages = stages
+            .Select(s => new OptionRef { Id = s.Key, Title = s.Name })
+            .ToList();
+
         return new Block
         {
             Type = "stage_list",

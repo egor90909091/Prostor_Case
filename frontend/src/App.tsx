@@ -6,9 +6,14 @@ import { AnalyticsView } from './AnalyticsView'
 import { DocumentsView } from './DocumentsView'
 import { ContractorInboxView } from './ContractorInboxView'
 import { getCompanies, type CompanyRef } from './api'
-import { CUSTOMER, setActor, useActor } from './identity'
+import { ADMIN, CUSTOMER, setActor, useActor } from './identity'
 
 type Tab = 'chat' | 'constructor' | 'documents' | 'analytics'
+
+// Какие разделы доступны роли. Админ не заводит заявки — он смотрит, что
+// происходит на платформе: сводная аналитика и все документы. Заказчик
+// работает со своей заявкой и видит аналитику только по ней.
+const ADMIN_TABS: Tab[] = ['documents', 'analytics']
 
 // Единый источник для обеих навигаций: верхних вкладок на десктопе и нижней
 // панели на телефоне. Список один, поэтому разъехаться они не могут — какая
@@ -74,12 +79,19 @@ const TABS: { key: Tab; label: string; short: string; crumb: string; icon: React
   },
 ]
 
+// «Мои заявки» у админа — чужие: он видит документы всех заказчиков, а не свои.
+// Отдельного списка вкладок ради одной подписи заводить незачем.
+function adminLabel(label: string, isAdmin: boolean): string {
+  return isAdmin && label === 'Мои заявки' ? 'Все заявки' : label
+}
+
 export default function App() {
   // Роль — переключатель демо-контекста, а не авторизация: логинов и паролей
   // в прототипе нет, см. identity.ts. Заказчик один (НТЦ), подрядчиков много —
   // это компании из catalog.company.
   const actor = useActor()
   const isContractor = actor.kind === 'contractor'
+  const isAdmin = actor.kind === 'admin'
   const [companies, setCompanies] = useState<CompanyRef[]>([])
 
   const [tab, setTab] = useState<Tab>('chat')
@@ -133,7 +145,13 @@ export default function App() {
     getCompanies().then((r) => setCompanies(r.items ?? [])).catch(() => undefined)
   }, [])
 
-  const active = TABS.find((t) => t.key === tab) ?? TABS[0]
+  // Вкладки текущей роли и активная среди них. Смена роли может оставить
+  // выбранной вкладку, которой у новой роли нет (админ переключился с
+  // «Аналитики» на заказчика и обратно — «Чат» админу не положен), поэтому
+  // активную выбираем из доступных, а не из общего списка.
+  const tabs = isAdmin ? TABS.filter((t) => ADMIN_TABS.includes(t.key)) : TABS
+  const active = tabs.find((t) => t.key === tab) ?? tabs[0]
+  const currentTab = active.key
 
   return (
     <div className="app">
@@ -148,7 +166,7 @@ export default function App() {
               верхние вкладки там скрыты, и без подписи было бы непонятно, где ты. */}
           <div className="crumbs">
             <span className="sep">›</span>
-            <span>{isContractor ? 'Входящие ТЗ' : active.crumb}</span>
+            <span>{isContractor ? 'Входящие ТЗ' : adminLabel(active.crumb, isAdmin)}</span>
           </div>
         </div>
 
@@ -156,9 +174,13 @@ export default function App() {
             вырождается в подпись. Показывать её не за что. */}
         {!isContractor && (
           <nav className="topbar-nav">
-            {TABS.map((t) => (
-              <button key={t.key} className={tab === t.key ? 'on' : ''} onClick={() => setTab(t.key)}>
-                {t.label}
+            {tabs.map((t) => (
+              <button
+                key={t.key}
+                className={currentTab === t.key ? 'on' : ''}
+                onClick={() => setTab(t.key)}
+              >
+                {adminLabel(t.label, isAdmin)}
               </button>
             ))}
           </nav>
@@ -178,6 +200,10 @@ export default function App() {
                 setActor(CUSTOMER)
                 return
               }
+              if (value === 'admin') {
+                setActor(ADMIN)
+                return
+              }
               const company = companies.find((c) => c.companyId === value)
               if (company) {
                 setActor({
@@ -191,6 +217,9 @@ export default function App() {
           >
             <optgroup label="Заказчик">
               <option value="ntc">НТЦ</option>
+            </optgroup>
+            <optgroup label="Администратор">
+              <option value="admin">Администратор платформы</option>
             </optgroup>
             <optgroup label="Подрядчик">
               {companies.map((c) => (
@@ -210,7 +239,7 @@ export default function App() {
           переключение без сети; восстановление после полной перезагрузки страницы
           отдельно решено в ChatView через localStorage + GET /sessions/{id}.
         */}
-        <div hidden={isContractor || tab !== 'chat'}>
+        <div hidden={isContractor || isAdmin || currentTab !== 'chat'}>
           <ChatView
             onOpenConstructor={openConstructor}
             onOpenDocuments={openDocuments}
@@ -231,7 +260,7 @@ export default function App() {
           вкладки — зону готового документа, замечания ИИ, а в режиме
           редактирования ещё и перечитывал ТЗ из БД поверх правок пользователя.
         */}
-        <div hidden={isContractor || tab !== 'constructor'}>
+        <div hidden={isContractor || isAdmin || currentTab !== 'constructor'}>
           <ConstructorView
             sessionId={sessionId}
             editRequest={editRequest}
@@ -241,10 +270,19 @@ export default function App() {
             onDocumentCreated={(tzId) => setDocumentCreated({ tzId, at: Date.now() })}
           />
         </div>
-        {!isContractor && tab === 'documents' && (
-          <DocumentsView onOpenInConstructor={openTzInConstructor} focusTzId={focusTzId} />
+        {!isContractor && currentTab === 'documents' && (
+          <DocumentsView
+            title={isAdmin ? 'Все заявки' : 'Мои заявки'}
+            readOnly={isAdmin}
+            // Открыть ТЗ в конструкторе может только тот, кто его ведёт:
+            // у админа конструктора нет, у него это витрина, а не рабочее место.
+            onOpenInConstructor={isAdmin ? undefined : openTzInConstructor}
+            focusTzId={focusTzId}
+          />
         )}
-        {!isContractor && tab === 'analytics' && <AnalyticsView />}
+        {!isContractor && currentTab === 'analytics' && (
+          <AnalyticsView scope={isAdmin ? 'admin' : 'customer'} />
+        )}
         {/* Экран подрядчика. Чат и конструктор выше остаются смонтированными
             и под этой ролью: примерка роли подрядчика не должна стирать
             диалог и форму заказчика — вернувшись, он продолжит с того места,
@@ -259,12 +297,12 @@ export default function App() {
           display: grid, который перебивает атрибут hidden. */}
       {!isContractor && (
       <nav className="tabbar" aria-label="Разделы">
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <button
             key={t.key}
-            className={tab === t.key ? 'on' : ''}
+            className={currentTab === t.key ? 'on' : ''}
             onClick={() => setTab(t.key)}
-            aria-current={tab === t.key ? 'page' : undefined}
+            aria-current={currentTab === t.key ? 'page' : undefined}
           >
             <span className="tabbar-icon">{t.icon}</span>
             <span className="tabbar-label">{t.short}</span>

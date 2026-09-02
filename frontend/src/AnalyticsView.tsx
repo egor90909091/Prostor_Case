@@ -17,7 +17,6 @@ import { getAnalytics, listTzDocuments } from './api'
 
 interface Overview {
   topSearchedProducts: { name: string; cnt: number }[]
-  unrecognizedQueries: { query: string; created_at: string }[]
   topPairs: { product: string; related: string; cnt: number }[]
   topExecutors: { name: string; works: number; products: number }[]
   tzCreated: number
@@ -54,7 +53,21 @@ const dayLabel = (iso: string) => {
   return `${d}.${m}`
 }
 
-export function AnalyticsView() {
+/**
+ * Дашборд аналитики в двух видах.
+ *
+ * Заказчик видит показатели своей работы: сколько ТЗ собрано, насколько они
+ * готовы, как идёт согласование с подрядчиками, на чём чаще всего спотыкаются
+ * его ТЗ. Сводная картина платформы — качество распознавания запросов, спрос
+ * по каталогу, рынок исполнителей, кандидаты на упаковку в продукт — это
+ * материалы владельца платформы, и они открыты только админу.
+ *
+ * Заказчик пока один, поэтому его показатели считаются по всем документам;
+ * когда заказчиков станет много, фильтр добавится здесь же, а состав панелей
+ * менять уже не придётся.
+ */
+export function AnalyticsView({ scope = 'customer' }: { scope?: 'customer' | 'admin' }) {
+  const platform = scope === 'admin'
   const [data, setData] = useState<Overview | null>(null)
   const [documents, setDocuments] = useState<any[]>([])
 
@@ -89,13 +102,13 @@ export function AnalyticsView() {
     Math.max(1, ...rows.map((r: any) => r[key] ?? 0))
 
   const exportCsv = () => {
-    downloadCsv(buildAnalyticsCsv(data, documents, totalRequests, recognizedShare))
+    downloadCsv(buildAnalyticsCsv(data, documents, totalRequests, recognizedShare, platform), platform)
   }
 
   return (
     <div className="analytics">
       <div className="analytics-head">
-        <h2>Аналитика</h2>
+        <h2>{platform ? 'Аналитика платформы' : 'Аналитика по моим заявкам'}</h2>
         <div className="analytics-actions">
           <button className="btn small ghost" onClick={exportCsv}>
             <DownloadIcon />
@@ -109,8 +122,12 @@ export function AnalyticsView() {
       </div>
 
       <div className="kpis">
-        <Kpi label="Запросов за 30 дней" value={totalRequests} />
-        <Kpi label="Распознано" value={`${recognizedShare}%`} />
+        {platform && (
+          <>
+            <Kpi label="Запросов за 30 дней" value={totalRequests} />
+            <Kpi label="Распознано" value={`${recognizedShare}%`} />
+          </>
+        )}
         <Kpi label="Создано ТЗ" value={data.tzCreated} />
         <Kpi label="Средняя готовность" value={`${data.tzAvgReadiness}%`} />
         {data.review && data.review.sent > 0 && (
@@ -122,6 +139,7 @@ export function AnalyticsView() {
       </div>
 
       <div className="grid">
+        {platform && (
         <Panel title="Количество запросов по дням" wide>
           {totalRequests === 0 ? (
             <p className="muted">За последние 30 дней запросов не было</p>
@@ -155,6 +173,7 @@ export function AnalyticsView() {
             { color: '#e65907', label: 'Не распознано' },
           ]} />
         </Panel>
+        )}
 
         <Panel title="Какие виды ТЗ выбираются чаще">
           {data.tzByTemplate.length === 0 ? (
@@ -181,6 +200,7 @@ export function AnalyticsView() {
           )}
         </Panel>
 
+        {platform && (
         <Panel title="Самые востребованные услуги по запросам">
           {data.topSearchedProducts.length === 0 ? (
             <p className="muted">Нет данных</p>
@@ -197,6 +217,7 @@ export function AnalyticsView() {
             </ResponsiveContainer>
           )}
         </Panel>
+        )}
 
         <Panel title="Создание ТЗ по дням">
           {data.tzCreated === 0 ? (
@@ -234,21 +255,25 @@ export function AnalyticsView() {
           </Panel>
         )}
 
-        <Panel title="Исполнители с наибольшим числом аналогичных работ">
-          <Bars rows={data.topExecutors.map((r) => ({ label: `${r.name} · ${r.products} услуг`, value: r.works }))}
-                max={max(data.topExecutors, 'works')} />
-        </Panel>
+        {platform && (
+          <Panel title="Исполнители с наибольшим числом аналогичных работ">
+            <Bars rows={data.topExecutors.map((r) => ({ label: `${r.name} · ${r.products} услуг`, value: r.works }))}
+                  max={max(data.topExecutors, 'works')} />
+          </Panel>
+        )}
 
-        <Panel title="Наиболее часто сочетаемые услуги">
-          <ul className="plain">
-            {data.topPairs.map((pair, i) => (
-              <li key={i}>
-                {pair.product} <span className="muted">+</span> {pair.related}
-                <span className="muted"> · {pair.cnt} договоров</span>
-              </li>
-            ))}
-          </ul>
-        </Panel>
+        {platform && (
+          <Panel title="Наиболее часто сочетаемые услуги">
+            <ul className="plain">
+              {data.topPairs.map((pair, i) => (
+                <li key={i}>
+                  {pair.product} <span className="muted">+</span> {pair.related}
+                  <span className="muted"> · {pair.cnt} договоров</span>
+                </li>
+              ))}
+            </ul>
+          </Panel>
+        )}
 
         <Panel title="Типичные ошибки при формировании ТЗ">
           {data.topRisks.length === 0 ? (
@@ -275,6 +300,7 @@ export function AnalyticsView() {
           )}
         </Panel>
 
+        {platform && (
         <Panel title="Кандидаты на упаковку в типовой продукт" wide>
           <table className="mini">
             <colgroup>
@@ -298,20 +324,9 @@ export function AnalyticsView() {
             </tbody>
           </table>
         </Panel>
+        )}
 
-        <Panel title="Запросы, не распознанные агентом">
-          {data.unrecognizedQueries.length === 0 ? (
-            <p className="muted">Все запросы нашли услуги</p>
-          ) : (
-            <ul className="plain">
-              {data.unrecognizedQueries.map((row, i) => (
-                <li key={i}>«{row.query}»</li>
-              ))}
-            </ul>
-          )}
-        </Panel>
-
-        <Panel title="Последние созданные ТЗ" wide>
+        <Panel title={platform ? 'Последние ТЗ на платформе' : 'Мои последние ТЗ'} wide>
           {documents.length === 0 ? (
             <p className="muted">ТЗ пока не создавались</p>
           ) : (
@@ -440,52 +455,68 @@ function csvSection(title: string, header: string[], rows: (string | number | nu
   return lines.join('\n')
 }
 
+// Выгрузка повторяет то, что человек видит на экране: панели платформы
+// попадают в файл только у админа. Иначе «Скачать CSV» отдавало бы заказчику
+// ровно те данные, которые с дашборда убраны.
 function buildAnalyticsCsv(
   data: Overview,
   documents: any[],
   totalRequests: number,
   recognizedShare: number,
+  platform: boolean,
 ): string {
   const sections = [
     csvSection('Сводка', ['Метрика', 'Значение'], [
-      ['Запросов за 30 дней', totalRequests],
-      ['Распознано, %', recognizedShare],
+      ...(platform
+        ? [['Запросов за 30 дней', totalRequests], ['Распознано, %', recognizedShare]]
+        : []),
       ['Создано ТЗ', data.tzCreated],
       ['Средняя готовность, %', data.tzAvgReadiness],
     ]),
-    csvSection('Запросы по дням', ['День', 'Распознано', 'Не распознано'],
-      data.requestsByDay.map((r) => [r.day, r.recognized, r.unrecognized])),
+    ...(platform
+      ? [csvSection('Запросы по дням', ['День', 'Распознано', 'Не распознано'],
+          data.requestsByDay.map((r) => [r.day, r.recognized, r.unrecognized]))]
+      : []),
     csvSection('Создание ТЗ по дням', ['День', 'Количество'],
       data.tzByDay.map((r) => [r.day, r.cnt])),
-    csvSection('Самые востребованные услуги', ['Услуга', 'Запросов'],
-      data.topSearchedProducts.map((r) => [r.name, r.cnt])),
+    ...(platform
+      ? [csvSection('Самые востребованные услуги', ['Услуга', 'Запросов'],
+          data.topSearchedProducts.map((r) => [r.name, r.cnt]))]
+      : []),
     csvSection('Виды ТЗ', ['Шаблон', 'Количество'],
       data.tzByTemplate.map((r) => [r.name, r.cnt])),
-    csvSection('Исполнители', ['Исполнитель', 'Работ', 'Услуг'],
-      data.topExecutors.map((r) => [r.name, r.works, r.products])),
-    csvSection('Сочетаемые услуги', ['Услуга', 'Сопутствующая услуга', 'Договоров'],
-      data.topPairs.map((r) => [r.product, r.related, r.cnt])),
+    ...(platform
+      ? [
+          csvSection('Исполнители', ['Исполнитель', 'Работ', 'Услуг'],
+            data.topExecutors.map((r) => [r.name, r.works, r.products])),
+          csvSection('Сочетаемые услуги', ['Услуга', 'Сопутствующая услуга', 'Договоров'],
+            data.topPairs.map((r) => [r.product, r.related, r.cnt])),
+        ]
+      : []),
     csvSection('Типичные ошибки при формировании ТЗ', ['Риск', 'Критичность', 'Количество'],
       data.topRisks.map((r) => [r.title, r.severity, r.cnt])),
     csvSection('Часто добавляемые этапы', ['Этап', 'Количество'],
       data.topStages.map((r) => [r.name, r.cnt])),
-    csvSection('Кандидаты на упаковку в типовой продукт', ['Услуга', 'Расчётов', 'Компаний', 'Типовой срок, дн'],
-      data.productizationCandidates.map((r) => [r.name, r.calcs_cnt, r.companies_cnt, r.typical_duration_days ?? ''])),
-    csvSection('Нераспознанные запросы', ['Запрос', 'Дата'],
-      data.unrecognizedQueries.map((r) => [r.query, r.created_at])),
-    csvSection('Последние созданные ТЗ', ['Услуга', 'Объект', 'Готовность, %', 'Рисков'],
+    ...(platform
+      ? [csvSection('Кандидаты на упаковку в типовой продукт',
+          ['Услуга', 'Расчётов', 'Компаний', 'Типовой срок, дн'],
+          data.productizationCandidates.map(
+            (r) => [r.name, r.calcs_cnt, r.companies_cnt, r.typical_duration_days ?? '']))]
+      : []),
+    csvSection(platform ? 'Последние ТЗ на платформе' : 'Мои последние ТЗ',
+      ['Услуга', 'Объект', 'Готовность, %', 'Рисков'],
       documents.map((d) => [d.productName, d.objectName, d.readiness, d.risksCount])),
   ]
   return sections.join('\n\n')
 }
 
-function downloadCsv(content: string) {
+function downloadCsv(content: string, platform: boolean) {
   const blob = new Blob(['﻿' + content], { type: 'text/csv;charset=utf-8;' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   const date = new Date().toISOString().slice(0, 10)
   a.href = url
-  a.download = `analytics_${date}.csv`
+  a.download = `${platform ? 'analytics_platform' : 'analytics'}_${date}.csv`
   document.body.appendChild(a)
   a.click()
   a.remove()

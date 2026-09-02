@@ -50,6 +50,14 @@ builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
 
 var app = builder.Build();
 app.UseCors();
+
+// Бюджет хода должен покрывать оба вызова модели: иначе ход рубится посреди
+// стрима, и карточки (они уходят после текста) не доезжают до клиента вовсе.
+if (config.TurnTimeoutSeconds < 2 * config.LlmTimeoutSeconds + config.EmbeddingTimeoutSeconds)
+    app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("config").LogWarning(
+        "TURN_TIMEOUT_SECONDS={Turn} меньше двух вызовов модели ({Llm} с) плюс эмбеддинг ({Emb} с): " +
+        "долгий ход будет обрываться по таймауту", 
+        config.TurnTimeoutSeconds, config.LlmTimeoutSeconds, config.EmbeddingTimeoutSeconds);
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
 // Индексатор заполняет только строки с embedding IS NULL, поэтому смена модели
@@ -259,6 +267,10 @@ app.MapGet("/api/v1/chat/sessions/{sessionId:guid}/ws", async (
                     message = "Предыдущий запрос ещё выполняется",
                     activeTurnId = activeTurn
                 }), ct);
+            // Отказ — тоже конец хода: без терминального события клиент остался
+            // бы висеть в состоянии «идёт ход» до закрытия вкладки.
+            await sink.WriteAsync("done",
+                Json.Write(new { activeTurnId = activeTurn, status = "rejected" }), ct);
             continue;
         }
 
@@ -314,6 +326,48 @@ async Task<ChatState> RunTurnAsync(
         await sink.WriteAsync(name, data, token);
     }
 
+    var collected = new List<Block>();
+    // Стримящийся ответ приходит дельтами, а не блоком, и раньше нигде не
+    // сохранялся: при перезагрузке страницы реплики ассистента исчезали, а
+    // в транскрипт диалога (а значит и в контекст следующего хода) попадали
+    // только служебные текстовые блоки. Собираем дельты обратно в один
+    // текстовый блок — он идёт первым, как и на экране.
+    var spoken = new StringBuilder();
+
+    // Сказанное сохраняется одинаково и на удачном ходе, и на прерванном: иначе
+    // после таймаута в ленте остаётся реплика пользователя без ответа, и она же
+    // уходит в контекст следующего хода. ChatState меняется на месте, поэтому
+    // применённые до обрыва факты тоже доезжают до базы.
+    async Task SaveAsync()
+    {
+        var message = new List<Block>();
+        if (spoken.Length > 0) message.Add(Block.TextBlock(spoken.ToString().Trim()));
+        message.AddRange(collected);
+        if (message.Count == 0) return;
+
+        await db.SaveStateAsync(sessionId, state, CancellationToken.None);
+        await db.AppendMessageAsync(sessionId, "assistant", Json.Write(message), CancellationToken.None);
+    }
+
+    // Ход обязан кончиться терминальным событием, чем бы он ни кончился: клиент
+    // держит соединение до done и без него ждёт вечно — на экране это выглядит
+    // как зависший чат. Пишем в обход turnCt: он к этому моменту уже мог сработать.
+    async Task FinishAsync(string status, string? error)
+    {
+        await db.FinishTurnAsync(turnId, status, CancellationToken.None);
+        try
+        {
+            if (error is not null)
+                await EmitAsync("error", new { message = error, turnId }, CancellationToken.None);
+            await EmitAsync("done", new { turnId, status }, CancellationToken.None);
+        }
+        catch (Exception)
+        {
+            // соединение уже закрыто — хвост хода остался в БД, клиент доберёт
+            // его через /turns/{id}/stream?fromSeq=N
+        }
+    }
+
     try
     {
         await EmitAsync("meta", new { turnId, sessionId }, turnCt);
@@ -330,13 +384,6 @@ async Task<ChatState> RunTurnAsync(
             : new JsonArray(new JsonObject { ["type"] = "text", ["text"] = request.Text ?? "" });
         await db.AppendMessageAsync(sessionId, "user", userBlocks.ToJsonString(), turnCt);
 
-        var collected = new List<Block>();
-        // Стримящийся ответ приходит дельтами, а не блоком, и раньше нигде не
-        // сохранялся: при перезагрузке страницы реплики ассистента исчезали, а
-        // в транскрипт диалога (а значит и в контекст следующего хода) попадали
-        // только служебные текстовые блоки. Собираем дельты обратно в один
-        // текстовый блок — он идёт первым, как и на экране.
-        var spoken = new StringBuilder();
         Task Collect(string name, object payload, CancellationToken token)
         {
             if (payload is not null)
@@ -353,35 +400,25 @@ async Task<ChatState> RunTurnAsync(
 
         state = await pipeline.RunAsync(sessionId, state, request, Collect, turnCt);
 
-        var message = new List<Block>();
-        if (spoken.Length > 0) message.Add(Block.TextBlock(spoken.ToString().Trim()));
-        message.AddRange(collected);
-
-        await db.SaveStateAsync(sessionId, state, CancellationToken.None);
-        await db.AppendMessageAsync(sessionId, "assistant", Json.Write(message), CancellationToken.None);
-        await db.FinishTurnAsync(turnId, "done", CancellationToken.None);
-        await EmitAsync("done", new { turnId }, turnCt);
+        await SaveAsync();
+        await FinishAsync("done", null);
     }
     catch (OperationCanceledException)
     {
         // Ход дописан в БД независимо от состояния соединения: клиент
         // переподключится на /stream?fromSeq=N и доберёт хвост
-        await db.FinishTurnAsync(turnId, connectionCt.IsCancellationRequested ? "cancelled" : "timeout",
-            CancellationToken.None);
-        log.LogInformation("ход {TurnId} прерван", turnId);
+        var status = connectionCt.IsCancellationRequested ? "cancelled" : "timeout";
+        await SaveAsync();
+        await FinishAsync(status, status == "timeout"
+            ? "Ответ не уложился в отведённое на ход время. Показал то, что успел собрать."
+            : null);
+        log.LogInformation("ход {TurnId} прерван: {Status}", turnId, status);
     }
     catch (Exception ex)
     {
         log.LogError(ex, "ошибка хода {TurnId}", turnId);
-        await db.FinishTurnAsync(turnId, "failed", CancellationToken.None);
-        try
-        {
-            await sink.WriteAsync("error", Json.Write(new { message = "internal_error" }), CancellationToken.None);
-        }
-        catch
-        {
-            // соединение уже закрыто
-        }
+        await SaveAsync();
+        await FinishAsync("failed", "internal_error");
     }
 
     return state;

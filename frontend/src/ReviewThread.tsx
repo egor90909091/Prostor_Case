@@ -26,12 +26,15 @@ export function ReviewThread({
   onSubmit,
   onFixSection,
   placeholder = 'Написать по документу…',
+  readOnly = false,
 }: {
   comments: ReviewComment[]
   myKind: 'customer' | 'contractor'
   /** Разделы документа для привязки замечания. Пусто — только общий комментарий. */
   sections?: { key: string; title: string }[]
   onSubmit: (text: string, sectionKey: string | null) => Promise<void>
+  /** Тред виден, но писать в него нельзя: роль наблюдателя (админ). */
+  readOnly?: boolean
   /** Заказчик: перейти к правке раздела в конструкторе. */
   onFixSection?: (sectionKey: string) => void
   placeholder?: string
@@ -92,6 +95,7 @@ export function ReviewThread({
         </ul>
       )}
 
+      {readOnly ? null : (
       <div className="review-form">
         {sections && sections.length > 0 && (
           <select
@@ -116,6 +120,7 @@ export function ReviewThread({
           {sending ? 'Отправляю…' : 'Отправить'}
         </button>
       </div>
+      )}
     </div>
   )
 }

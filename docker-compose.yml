@@ -71,6 +71,13 @@ services:
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      # Таймауты. LLM_TIMEOUT_SECONDS — потолок одного вызова модели (истёк —
+      # ход не падает, а идёт по детерминированной ветке). TURN_TIMEOUT_SECONDS —
+      # страховка на ход целиком; ход свободного текста делает два вызова модели
+      # подряд, поэтому бюджет держим выше 2 x LLM_TIMEOUT_SECONDS.
+      EMBEDDING_TIMEOUT_SECONDS: ${EMBEDDING_TIMEOUT_SECONDS:-5}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-45}
+      TURN_TIMEOUT_SECONDS: ${TURN_TIMEOUT_SECONDS:-150}
       # Роутер свободного текста (tool call search_services вместо жёсткого
       # "любой текст — поиск"). false — мгновенный откат на старое поведение
       # без пересборки образа, если провайдер плохо держит tool calling.

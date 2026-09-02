@@ -94,6 +94,15 @@ public sealed class ChatState
     [JsonPropertyName("lastOptions")] public List<OptionRef> LastOptions { get; set; } = new();
 
     /// <summary>
+    /// Последний показанный список этапов — цель для выбора словами. Ровно тот
+    /// же приём, что и с услугами: человек называет этап словами («давай этап 1
+    /// Уточнение»), модель возвращает только его номер в этом списке, ключ
+    /// подставляет код. Без этого названные этапы оседали текстом в «особых
+    /// условиях», а в карточке не отмечались.
+    /// </summary>
+    [JsonPropertyName("lastStages")] public List<OptionRef> LastStages { get; set; } = new();
+
+    /// <summary>
     /// Какую карточку показали в прошлом ходе. Одно и то же предложение два
     /// хода подряд превращает диалог в назойливую анкету, поэтому повтор
     /// подавляется (TurnPipeline.OfferAsync).
@@ -127,6 +136,7 @@ public sealed class ChatState
         {
             case "product":
                 Stages.Clear();
+                LastStages.Clear();
                 OperationIds.Clear();
                 Executors.Clear();
                 TzId = null;

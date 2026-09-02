@@ -11,6 +11,8 @@ TZ="${TZ:-http://localhost:8081}"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mПРОВАЛ: %s\033[0m\n' "$1"; exit 1; }
+# stat -c у GNU и -f у BSD/macOS несовместимы, а wc есть везде.
+filesize() { wc -c < "$1" | tr -d ' '; }
 
 command -v jq >/dev/null || fail "нужен jq"
 
@@ -37,8 +39,24 @@ SEARCH=$(curl -sf -X POST "$CHAT/api/v1/catalog/products/search" \
 echo "$SEARCH" | jq -r '.items[] | "  \(.rank). \(.name)  score=\(.score)"'
 COUNT=$(echo "$SEARCH" | jq '.items | length')
 [ "$COUNT" -gt 0 ] || fail "поиск ничего не вернул"
-PRODUCT_ID=$(echo "$SEARCH" | jq -r '.items[0].productId')
-TEMPLATE_ID=$(echo "$SEARCH" | jq -r '.items[0].templateId')
+
+# Сценарий доходит до выгрузки документа, а она требует непустого состава
+# работ: без этапов черновик остаётся с blocking-риском no_stages и
+# /tz/documents честно отвечает 422. Типовые этапы агрегируются из истории и
+# есть не у каждой услуги каталога, а верх выдачи меняется при правке весов
+# ранжирования — поэтому берём не первый результат, а первый с этапами.
+PRODUCT_ID=""
+for i in $(seq 0 $((COUNT - 1))); do
+  CAND=$(echo "$SEARCH" | jq -r ".items[$i].productId")
+  STAGES=$(curl -sf "$CHAT/api/v1/catalog/products/$CAND/stages?top=5" || echo '{"items":[]}')
+  [ "$(echo "$STAGES" | jq '.items | length')" -gt 0 ] || continue
+  PRODUCT_ID="$CAND"
+  TEMPLATE_ID=$(echo "$SEARCH" | jq -r ".items[$i].templateId")
+  PRODUCT_NAME=$(echo "$SEARCH" | jq -r ".items[$i].name")
+  break
+done
+[ -n "$PRODUCT_ID" ] || fail "ни у одной услуги из выдачи нет типовых этапов"
+echo "для сценария выбрана: $PRODUCT_NAME"
 
 say "сессия чата"
 SESSION=$(curl -sf -X POST "$CHAT/api/v1/chat/sessions" \
@@ -71,7 +89,6 @@ echo "$EXEC" | jq -r '.items[] | "  \(.rank). \(.name) score=\(.score) загр�
 COMPANY=$(echo "$EXEC" | jq -r '.items[0].companyId')
 
 say "этапы услуги"
-STAGES=$(curl -sf "$CHAT/api/v1/catalog/products/$PRODUCT_ID/stages?top=5")
 echo "$STAGES" | jq -r '.items[] | "  · \(.name[0:70]) (\(.medianDays // 0) дн.)"'
 
 say "черновик ТЗ: пустое состояние -> должны быть критичные риски"
@@ -107,13 +124,18 @@ curl -sf -X POST "$TZ/api/v1/tz/drafts" -H 'Content-Type: application/json' \
   && echo "риск корректно сработал" || fail "риск 3D не сработал"
 
 say "выгрузка документа"
-DOC=$(curl -sf -X POST "$TZ/api/v1/tz/documents" -H 'Content-Type: application/json' \
+# Без -f: на 422 (черновик не прошёл проверку готовности) тело ответа объясняет
+# причину, и оно полезнее молчаливого выхода по set -e.
+RESP=$(curl -s -w '\n%{http_code}' -X POST "$TZ/api/v1/tz/documents" -H 'Content-Type: application/json' \
   -d "{\"sessionId\":\"$SESSION\",\"templateId\":\"$TEMPLATE_ID\",\"state\":$STATE}")
+CODE=$(echo "$RESP" | tail -n1)
+DOC=$(echo "$RESP" | sed '$d')
+case "$CODE" in 2*) ;; *) fail "документ не создан (код $CODE): $(echo "$DOC" | jq -r '.recommendation // .error // .')";; esac
 TZ_ID=$(echo "$DOC" | jq -r '.tzId')
 echo "$DOC" | jq -r '"tzId=\(.tzId) готовность=\(.readiness)% сохранён в S3: \(.stored)"'
 
-curl -sf "$TZ/api/v1/tz/documents/$TZ_ID/file" -o /tmp/smoke_tz.docx
-SIZE=$(stat -c%s /tmp/smoke_tz.docx)
+curl -sf "$TZ/api/v1/tz/documents/$TZ_ID/file" -o /tmp/smoke_tz.docx || fail "docx не скачался"
+SIZE=$(filesize /tmp/smoke_tz.docx)
 [ "$SIZE" -gt 1500 ] || fail "docx подозрительно мал ($SIZE байт)"
 head -c 2 /tmp/smoke_tz.docx | grep -q 'PK' || fail "docx не является zip-архивом"
 echo "документ скачан: $SIZE байт, /tmp/smoke_tz.docx"
@@ -123,8 +145,8 @@ echo "документ скачан: $SIZE байт, /tmp/smoke_tz.docx"
 # это ограничение окружения (см. /health -> pdf), а не провал сценария.
 PDF_STATE=$(curl -sf "$TZ/health" | jq -r '.pdf')
 if [ "$PDF_STATE" = "ready" ]; then
-  curl -sf "$TZ/api/v1/tz/documents/$TZ_ID/file?format=pdf" -o /tmp/smoke_tz.pdf
-  PDF_SIZE=$(stat -c%s /tmp/smoke_tz.pdf)
+  curl -sf "$TZ/api/v1/tz/documents/$TZ_ID/file?format=pdf" -o /tmp/smoke_tz.pdf || fail "pdf не скачался"
+  PDF_SIZE=$(filesize /tmp/smoke_tz.pdf)
   head -c 5 /tmp/smoke_tz.pdf | grep -q '%PDF' || fail "pdf не является PDF-файлом"
   [ "$PDF_SIZE" -gt 5000 ] || fail "pdf подозрительно мал ($PDF_SIZE байт)"
   echo "тот же документ в PDF: $PDF_SIZE байт, /tmp/smoke_tz.pdf"

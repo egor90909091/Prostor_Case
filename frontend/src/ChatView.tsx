@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createSession, getSession, sendTurn } from './api'
 import type { Block, ChatStateSnapshot, TurnAction } from './api'
 import { BlockView } from './Blocks'
@@ -7,9 +7,79 @@ import { CHAT_SESSION_KEY as SESSION_STORAGE_KEY, resetWorkspace, useCurrentDocu
 import { documentFileUrl } from './api'
 
 interface Message {
+  // Стабильный ключ рендера. Индекс массива не годится: переигранный выбор
+  // схлопывает пару реплик, индексы едут, и React перемонтирует всю ленту —
+  // анимации перезапускаются, а локальное состояние блоков (отмеченные
+  // исполнители, развёрнутые операции) сбрасывается.
+  id: string
   role: 'user' | 'assistant'
   blocks: Block[]
+  // Клик, породивший реплику пользователя. Нужен, чтобы отличить переигранный
+  // выбор от следующего шага диалога (см. replayKey).
+  action?: TurnAction
 }
+
+// Действия, повторный вызов которых — это «передумал», а не новый шаг: выбрал
+// услугу, посмотрел на сроки, вернулся и выбрал другую. Показывать оба хода
+// подряд незачем — в ленте должно остаться последнее решение.
+const REPLAYABLE_ACTIONS = new Set(['select_product', 'select_executors'])
+
+/**
+ * Ключ переигрывания для реплики пользователя или null, если это обычный ход.
+ * Живая реплика несёт действие объектом, восстановленная из базы — блоком
+ * {type:"action", text:<тип действия>} (см. RunTurnAsync в Prostor.Chat),
+ * поэтому смотрим в оба места: правило должно работать одинаково и во время
+ * хода, и после перезагрузки страницы.
+ */
+function replayKey(message: Message): string | null {
+  const type =
+    message.action?.type ??
+    (message.blocks[0]?.type === 'action' ? message.blocks[0].text : undefined)
+  return type && REPLAYABLE_ACTIONS.has(type) ? type : null
+}
+
+/**
+ * Схлопывает подряд идущие переигранные выборы, оставляя последний.
+ *
+ * Пара — это реплика пользователя от клика плюс ответ ассистента на неё.
+ * Соседство обязательно: если между двумя выборами услуги был разговор
+ * словами или другой шаг заявки, прежняя карточка — часть истории, и
+ * подменять её задним числом нельзя. Зато у подряд идущих пар удаление
+ * прежней само ставит новую на её место — отдельная логика позиционирования
+ * не нужна.
+ */
+function collapseReplayedTurns(messages: Message[]): Message[] {
+  const drop = new Set<number>()
+  for (let i = 0; i + 2 < messages.length; i++) {
+    const key = replayKey(messages[i])
+    if (key === null) continue
+    if (messages[i + 1].role !== 'assistant') continue
+    if (replayKey(messages[i + 2]) !== key) continue
+    drop.add(i)
+    drop.add(i + 1)
+  }
+  return drop.size === 0 ? messages : messages.filter((_, i) => !drop.has(i))
+}
+
+// Пока начало ответа ниже этой границы, его подводят к верху экрана; выше —
+// считаем, что человек и так видит ответ с начала, и экран не трогаем.
+// Насколько именно отступить от верха, решает scroll-margin-top у .msg —
+// иначе липкая шапка накрыла бы первую строку.
+const ANCHOR_ZONE = 200
+
+/**
+ * Плавный проезд или мгновенный прыжок.
+ *
+ * prefers-reduced-motion приходится читать самим: блок @media в стилях гасит
+ * CSS-свойство scroll-behavior, но на явный behavior в scrollIntoView не
+ * влияет. А в скрытой вкладке smooth-скролл просто не выполняется — он идёт
+ * через requestAnimationFrame, который там заморожен; ход при этом
+ * продолжается, и человек вернулся бы к неподведённому ответу.
+ */
+const scrollBehavior = (): ScrollBehavior =>
+  document.hidden || window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    ? 'auto'
+    : 'smooth'
 
 const EXAMPLES = [
   'Нужно оценить запасы по объекту',
@@ -26,6 +96,7 @@ const EXAMPLES = [
 // страницы не потерять связь заявки с диалогом.
 
 const WELCOME_MESSAGE: Message = {
+  id: 'welcome',
   role: 'assistant',
   blocks: [
     {
@@ -65,7 +136,14 @@ export function ChatView({
   // стрим больше не должен выдёргивать экран вниз при каждой новой реплике.
   const pinnedToBottom = useRef(true)
   const skipNextScroll = useRef(true)
-  const scrollTimer = useRef<number | null>(null)
+  // Фаза хода. По busy это не различить: setBusy(true) и первый setMessages
+  // попадают в один батч React, поэтому к моменту эффекта busy уже true и
+  // «своя реплика ушла» неотличимо от «пришёл ответ».
+  const turnPhase = useRef<'idle' | 'sent' | 'anchored'>('idle')
+  // Начало текущей реплики ассистента — к нему подводится экран за ход.
+  const answer = useRef<HTMLDivElement | null>(null)
+  const answerMoved = useRef(false)
+  const messageCounter = useRef(0)
   // Один и тот же документ во всех разделах: чат читает его из общего
   // хранилища, а не заводит собственную копию.
   const currentDocument = useCurrentDocument()
@@ -102,7 +180,7 @@ export function ChatView({
         skipNextScroll.current = true
         setMessages(
           detail.messages.length > 0
-            ? detail.messages.map((m) => ({ role: m.role, blocks: m.blocks }))
+            ? detail.messages.map((m) => ({ id: `h${m.seq}`, role: m.role, blocks: m.blocks }))
             : [WELCOME_MESSAGE],
         )
       })
@@ -138,24 +216,60 @@ export function ChatView({
     }
   }, [])
 
-  // Прокрутка к низу батчится через таймер, чтобы частые дельты стрима не
-  // запускали смуз-анимацию заново на каждый чанк — иначе экран дёргается
-  // вместо плавного «догоняющего» скролла. requestAnimationFrame здесь не
-  // подходит: он замирает на фоновой/неактивной вкладке, а стрим должен
-  // продолжать плавно доезжать до низа и в таком состоянии. При
-  // восстановлении истории первый проход — мгновенный прыжок, а не проезд
-  // через весь диалог.
+  // Экран движется только пока начало ответа не встанет под шапку, и замирает
+  // сразу после этого. Прежде скролл шёл на каждое изменение ленты — то есть
+  // на каждую дельту стрима и на каждый прилетевший блок — и целился в низ:
+  // клик «Выбрать услугу» добавляет шесть блоков разом, реплика вырастает выше
+  // экрана, и ответ улетал наверх за кадр.
   useEffect(() => {
-    if (messages.length === 0 || !pinnedToBottom.current) return
-    const behavior = skipNextScroll.current ? 'auto' : 'smooth'
-    skipNextScroll.current = false
-    if (scrollTimer.current !== null) window.clearTimeout(scrollTimer.current)
-    scrollTimer.current = window.setTimeout(() => {
-      bottom.current?.scrollIntoView({ behavior, block: 'end' })
-    }, 0)
-    return () => {
-      if (scrollTimer.current !== null) window.clearTimeout(scrollTimer.current)
+    if (messages.length === 0) return
+
+    // Восстановление истории и приветствие — мгновенно в низ, без проезда
+    // через весь диалог.
+    if (skipNextScroll.current) {
+      skipNextScroll.current = false
+      bottom.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
+      return
     }
+
+    // Пользователь ушёл читать историю вверх — не выдёргиваем экран.
+    if (!pinnedToBottom.current) return
+
+    // Начало ответа уже подведено: дальше текст стримится и приезжают
+    // карточки, но экран стоит — реплика растёт в спокойном поле зрения.
+    if (turnPhase.current === 'anchored') return
+
+    const behavior = scrollBehavior()
+    const last = messages[messages.length - 1]
+
+    if (turnPhase.current === 'sent' && last.role === 'assistant' && last.blocks.length > 0) {
+      const el = answer.current
+      if (!el) return
+      // Начало ответа уже в поле зрения: либо экран и так стоял высоко, либо
+      // переигранный выбор занял место прежней реплики. Дальше не двигаем
+      // ничего до конца хода — текст и карточки нарастают в спокойном кадре.
+      if (el.getBoundingClientRect().top <= ANCHOR_ZONE) {
+        turnPhase.current = 'anchored'
+        return
+      }
+      // Ответ ниже экрана — подводим его начало наверх и повторяем это, пока
+      // идёт ход. Одного раза мало: в первый момент реплика ещё в одну строку,
+      // и прокрутить страницу на нужную величину просто некуда — запас под
+      // ответом появляется только когда доедут остальные блоки. Повторные
+      // подводки идут мгновенно: перезапуск смуз-анимации на каждую дельту и
+      // есть то самое дёрганье, от которого мы здесь уходим.
+      el.scrollIntoView({ behavior: answerMoved.current ? 'auto' : behavior, block: 'start' })
+      answerMoved.current = true
+      return
+    }
+
+    // Своя реплика ушла, ответа ещё нет — показываем её и «агент анализирует…».
+    // Если конец ленты и так на экране — например, переигранный выбор занял
+    // место прежней реплики, — не двигаем ничего: pinnedToBottom для этого не
+    // годится, он обновляется по событию scroll и здесь ещё не пересчитан.
+    const tail = bottom.current?.getBoundingClientRect()
+    if (tail && tail.bottom >= 0 && tail.bottom <= window.innerHeight) return
+    bottom.current?.scrollIntoView({ behavior, block: 'end' })
   }, [messages])
 
   async function run(body: { text?: string; action?: TurnAction }, userLabel: string) {
@@ -165,9 +279,19 @@ export function ChatView({
     // Своя реплика — явное действие, ради которого стоит вернуться к низу,
     // даже если до этого пользователь листал историю вверх.
     pinnedToBottom.current = true
-    setMessages((prev) => [...prev, { role: 'user', blocks: [{ type: 'text', text: userLabel }] }])
+    turnPhase.current = 'sent'
+    answerMoved.current = false
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `m${++messageCounter.current}`,
+        role: 'user',
+        blocks: [{ type: 'text', text: userLabel }],
+        action: body.action,
+      },
+    ])
 
-    let assistant: Message = { role: 'assistant', blocks: [] }
+    let assistant: Message = { id: `m${++messageCounter.current}`, role: 'assistant', blocks: [] }
     setMessages((prev) => [...prev, assistant])
 
     const patch = (mutate: (m: Message) => void) =>
@@ -194,6 +318,7 @@ export function ChatView({
       onError: (message) => setError(message),
     })
 
+    turnPhase.current = 'idle'
     setBusy(false)
   }
 
@@ -231,6 +356,11 @@ export function ChatView({
     void startNewSession()
   }
 
+  // Лента на экране: подряд идущие переигранные выборы схлопнуты в последний.
+  // Последняя пара не схлопывается никогда, поэтому streaming/thinking можно
+  // считать по сырому массиву — конец у обоих один и тот же.
+  const visible = useMemo(() => collapseReplayedTurns(messages), [messages])
+
   const last = messages[messages.length - 1]
   const streaming = busy && last?.role === 'assistant' && last.blocks.length > 0
   const thinking = busy && (!last || last.role !== 'assistant' || last.blocks.length === 0)
@@ -258,17 +388,21 @@ export function ChatView({
         {error && <div className="banner error">{error}</div>}
 
         <div className="stream">
-          {messages.map((message, index) => {
-            const isLast = index === messages.length - 1
+          {visible.map((message, index) => {
+            const isLast = index === visible.length - 1
             const cls = `msg ${message.role}${isLast && streaming ? ' streaming' : ''}`
             return (
-              <div className={cls} key={index}>
+              <div
+                className={cls}
+                key={message.id}
+                ref={isLast && message.role === 'assistant' ? answer : undefined}
+              >
                 {message.blocks.map((block, i) => (
                   <BlockView
                     key={i}
                     block={block}
                     disabled={busy}
-                    selectedProductId={state?.productId}
+                    selection={state}
                     onAction={(action) => {
                       // В очередь, а не сразу в основной state конструктора:
                       // прямая запись до первого открытия вкладки взвела бы

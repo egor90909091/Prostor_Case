@@ -628,10 +628,6 @@ public sealed class Db
                    SELECT p.name, count(*)::int AS cnt
                    FROM analytics.search_log l JOIN catalog.product p ON p.product_id = l.top_product_id
                    GROUP BY p.name ORDER BY cnt DESC LIMIT 8) x),
-              'unrecognizedQueries', (
-                 SELECT coalesce(json_agg(x), '[]'::json) FROM (
-                   SELECT query, created_at FROM analytics.search_log
-                   WHERE NOT recognized ORDER BY created_at DESC LIMIT 10) x),
               'topPairs', (
                  SELECT coalesce(json_agg(x), '[]'::json) FROM (
                    SELECT a.name AS product, b.name AS related, c.cnt

@@ -26,6 +26,12 @@ export interface ChatStateSnapshot {
   stages: number
   executors: number
   executorNames?: string[]
+  // Идентификаторы выбранного (см. TurnPipeline.Snapshot). Нужны карточкам в
+  // ленте: по ним они отмечают выбранное независимо от того, кликом или
+  // словами это было сделано и как давно.
+  stageIds?: string[]
+  executorIds?: string[]
+  operationIds?: string[]
   tzId?: string
   // Поля ТЗ, собранные из разговора: приходят в каждом снапшоте состояния,
   // чтобы панель заявки показывала их сразу, а не после открытия конструктора.
@@ -151,7 +157,11 @@ export function sendTurn(
           handlers.onState?.(payload)
           break
         case 'error':
+          // Ошибка — терминальное событие: сервер шлёт следом done, но если
+          // соединение уже рвётся, закрываем сокет сами, иначе промис хода
+          // никогда не разрешится и чат останется «занят».
           handlers.onError?.(payload.message ?? 'ошибка')
+          socket.close()
           break
         case 'done':
           socket.close()

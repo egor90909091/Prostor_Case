@@ -100,12 +100,23 @@ function FolderIcon() {
 }
 
 export function DocumentsView({
+  title = 'Мои заявки',
+  readOnly = false,
   onOpenInConstructor,
   focusTzId,
 }: {
+  // Заголовок раздела: у заказчика это его заявки, у админа — все заявки
+  // платформы. Экран один и тот же, разная только точка зрения.
+  title?: string
+  // Витрина без действий: админ платформы смотрит чужие заявки, а направить
+  // ТЗ подрядчику или ответить на замечание — работа заказчика, который эту
+  // заявку ведёт. Скачивание и история версий остаются: это чтение.
+  readOnly?: boolean
   // sectionKey — раздел, к которому подрядчик оставил замечание: конструктор
   // подведёт к нужным полям, а не откроет форму с начала.
-  onOpenInConstructor: (tzId: string, sectionKey?: string) => void
+  // Не задан — заявку отсюда не редактируют (роль без конструктора), и кнопки
+  // перехода в него не показываются.
+  onOpenInConstructor?: (tzId: string, sectionKey?: string) => void
   // Документ, с которого открыт раздел: приходит из конструктора сразу после
   // формирования ТЗ, чтобы пользователь попадал на свой документ, а не искал
   // его в списке.
@@ -263,7 +274,7 @@ export function DocumentsView({
 
   return (
     <div className="documents" ref={previewRef}>
-      <h2>Мои заявки</h2>
+      <h2>{title}</h2>
 
       {/* Категории — состояние заявки в процессе: где она сейчас и чей ход.
           Счётчик на чипсе показывает, сколько заявок в этом состоянии; пустые
@@ -369,24 +380,28 @@ export function DocumentsView({
                   <PdfIcon />
                   Скачать .pdf
                 </a>
-                <button
-                  className="btn small primary"
-                  onClick={() => onOpenInConstructor(selectedId)}
-                >
-                  Открыть в конструкторе
-                </button>
-                <button
-                  className="btn small"
-                  disabled={selectedRow?.status === 'draft'}
-                  title={
-                    selectedRow?.status === 'draft'
-                      ? 'Черновик нельзя направить: сформируйте документ'
-                      : undefined
-                  }
-                  onClick={() => void openSend()}
-                >
-                  Направить подрядчику
-                </button>
+                {onOpenInConstructor && (
+                  <button
+                    className="btn small primary"
+                    onClick={() => onOpenInConstructor(selectedId)}
+                  >
+                    Открыть в конструкторе
+                  </button>
+                )}
+                {!readOnly && (
+                  <button
+                    className="btn small"
+                    disabled={selectedRow?.status === 'draft'}
+                    title={
+                      selectedRow?.status === 'draft'
+                        ? 'Черновик нельзя направить: сформируйте документ'
+                        : undefined
+                    }
+                    onClick={() => void openSend()}
+                  >
+                    Направить подрядчику
+                  </button>
+                )}
                 <button
                   className="btn small ghost"
                   onClick={() => setShowVersions((v) => !v)}
@@ -475,7 +490,12 @@ export function DocumentsView({
                     comments={comments}
                     myKind="customer"
                     onSubmit={comment}
-                    onFixSection={(sectionKey) => onOpenInConstructor(selectedId, sectionKey)}
+                    onFixSection={
+                      onOpenInConstructor
+                        ? (sectionKey) => onOpenInConstructor(selectedId, sectionKey)
+                        : undefined
+                    }
+                    readOnly={readOnly}
                     placeholder="Ответить подрядчику…"
                   />
                 </div>

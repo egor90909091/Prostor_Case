@@ -60,6 +60,13 @@ public sealed class BrainFacts
     public string? PeriodTo { get; init; }
     public IReadOnlyList<string> Flags { get; init; } = Array.Empty<string>();
 
+    /// <summary>
+    /// Номера этапов из последнего показанного списка, названные словами.
+    /// Номера, а не ключи: идентификаторов модель не видит и придумать не
+    /// может — их подставляет код (TurnPipeline.ResolveStages).
+    /// </summary>
+    public IReadOnlyList<int> StageNumbers { get; init; } = Array.Empty<int>();
+
     public static readonly BrainFacts Empty = new();
 }
 
@@ -133,7 +140,11 @@ public static class Brain
         "контекста); если срок назван неоднозначно — null и переспроси в reply. flags — " +
         "массив из значений \"model3d\" (нужна 3D геологическая модель), \"subcontract\" " +
         "(допускается субподряд), \"urgent\" (срочно); пустой массив, если ничего такого не " +
-        "прозвучало.\n" +
+        "прозвучало. stageNumbers — номера этапов из показанного списка этапов, которые " +
+        "человек назвал словами («давай этап 1 Уточнение и этап 3.1»); сопоставляй по " +
+        "названию, даже если он назвал его неточно или с опечаткой, а если не уверен, какой " +
+        "именно этап имеется в виду — пустой массив и переспроси в reply. Названия этапов " +
+        "НИКОГДА не пиши в other и другие текстовые поля: этапы выбираются только номерами.\n" +
         "- offer: что показать карточкой прямо сейчас — \"period\" (спросить сроки), " +
         "\"executors\" (показать исполнителей), \"stages\" (этапы работ), \"conditions\" " +
         "(условия выполнения), \"similar\" (похожие выполненные работы), \"tz\" (готовность " +
@@ -210,6 +221,12 @@ public static class Brain
             }
         };
         required.Add((JsonNode)"flags");
+        properties["stageNumbers"] = new JsonObject
+        {
+            ["type"] = "array",
+            ["items"] = new JsonObject { ["type"] = "integer" }
+        };
+        required.Add((JsonNode)"stageNumbers");
 
         return new JsonObject
         {
@@ -286,6 +303,12 @@ public static class Brain
             sb.AppendLine("Последний показанный список услуг (нумерация для optionIndex): " +
                 string.Join("; ", state.LastOptions.Select((o, i) => $"{i + 1}) {o.Title}")));
 
+        // Ровно то, что человек видит в карточке этапов, и в том же порядке —
+        // иначе номер из facts.stageNumbers указал бы не на тот этап.
+        if (state.LastStages.Count > 0)
+            sb.AppendLine("Показанный список этапов (нумерация для facts.stageNumbers): " +
+                string.Join("; ", state.LastStages.Select((o, i) => $"{i + 1}) {o.Title}")));
+
         if (!string.IsNullOrWhiteSpace(transcriptTail))
             sb.AppendLine("\nХод диалога (последняя реплика заказчика — текущее сообщение):\n" + transcriptTail);
 
@@ -358,7 +381,12 @@ public static class Brain
                 .Where(s => s is "model3d" or "subcontract" or "urgent")
                 .Select(s => s!)
                 .Distinct()
-                .ToList() ?? (IReadOnlyList<string>)Array.Empty<string>()
+                .ToList() ?? (IReadOnlyList<string>)Array.Empty<string>(),
+            StageNumbers = (facts["stageNumbers"] as JsonArray)?
+                .Select(n => n is JsonValue v && v.TryGetValue<int>(out var i) ? i : 0)
+                .Where(i => i > 0)
+                .Distinct()
+                .ToList() ?? (IReadOnlyList<int>)Array.Empty<int>()
         };
     }
 

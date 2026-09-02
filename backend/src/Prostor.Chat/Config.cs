@@ -47,8 +47,24 @@ public sealed class AppConfig
     public bool StructuredOutputs { get; init; } = false;
 
     public int EmbeddingTimeoutSeconds { get; init; } = 5;
+
+    /// <summary>
+    /// Потолок одного вызова модели. Истёк — не отказ хода: вызывающая ветка
+    /// (ThinkAsync, StreamAnswerAsync) ловит свой таймаут и работает дальше по
+    /// детерминированной ветке.
+    /// </summary>
     public int LlmTimeoutSeconds { get; init; } = 45;
-    public int TurnTimeoutSeconds { get; init; } = 60;
+
+    /// <summary>
+    /// Потолок хода целиком. Это страховка от зависшего хода, а не рабочий
+    /// лимит: один ход свободного текста делает ДВА последовательных вызова
+    /// модели (мозг диалога + сопроводительный текст к выдаче), поэтому бюджет
+    /// должен покрывать 2 × <see cref="LlmTimeoutSeconds"/> плюс эмбеддинг и SQL.
+    /// Если он меньше, ход рубится посреди стрима — при этом уже собранные
+    /// карточки (они уходят после текста) не доезжают до клиента вообще.
+    /// </summary>
+    public int TurnTimeoutSeconds { get; init; } = 150;
+
     public int HeartbeatSeconds { get; init; } = 15;
 
     /// <summary>
@@ -142,7 +158,7 @@ public sealed class AppConfig
 
             EmbeddingTimeoutSeconds = GetInt("EMBEDDING_TIMEOUT_SECONDS", 5),
             LlmTimeoutSeconds = GetInt("LLM_TIMEOUT_SECONDS", 45),
-            TurnTimeoutSeconds = GetInt("TURN_TIMEOUT_SECONDS", 60),
+            TurnTimeoutSeconds = GetInt("TURN_TIMEOUT_SECONDS", 150),
             EnableRouter = GetBool("ENABLE_ROUTER", true),
 
             SearchMinScore       = GetDecimal("SEARCH_MIN_SCORE", 0.20m),

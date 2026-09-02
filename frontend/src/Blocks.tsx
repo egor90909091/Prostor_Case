@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import type { Block, BlockItem, TurnAction } from './api'
+import { useEffect, useRef, useState } from 'react'
+import type { Block, BlockItem, ChatStateSnapshot, TurnAction } from './api'
 import { documentFileUrl } from './api'
 
 interface Props {
@@ -10,9 +10,10 @@ interface Props {
   // Подсказка-чип отправляется как обычная реплика пользователя: это то же
   // самое, что он мог бы напечатать сам, поэтому отдельного действия у неё нет.
   onSuggest?: (text: string) => void
-  // id услуги, выбранной сейчас в заявке: карточка с этим id в истории
-  // подсвечивается как выбранная, чтобы выбор было видно в любом месте диалога.
-  selectedProductId?: string
+  // Состояние заявки. Карточки в ленте показывают по нему, что уже записано:
+  // выбор виден там же, где его сделали, а не только в боковой панели — и
+  // одинаково, кликнули по карточке или назвали пункт словами.
+  selection?: ChatStateSnapshot | null
 }
 
 export function BlockView({
@@ -21,7 +22,7 @@ export function BlockView({
   onAction,
   onOpenConstructor,
   onSuggest,
-  selectedProductId,
+  selection,
 }: Props) {
   switch (block.type) {
     case 'text':
@@ -31,28 +32,31 @@ export function BlockView({
     case 'suggestions':
       return <Suggestions block={block} disabled={disabled} onSuggest={onSuggest} />
     case 'product_list':
-      return (
-        <ProductList
-          block={block}
-          disabled={disabled}
-          onAction={onAction}
-          selectedProductId={selectedProductId}
-        />
-      )
+      return <ProductList block={block} disabled={disabled} onAction={onAction} selection={selection} />
     case 'company_list':
       return <CompanyList block={block} />
     case 'clarify':
       return <Clarify block={block} />
     case 'period_request':
-      return <PeriodRequest block={block} disabled={disabled} onAction={onAction} />
+      return (
+        <PeriodRequest block={block} disabled={disabled} onAction={onAction} selection={selection} />
+      )
     case 'executor_list':
-      return <ExecutorList block={block} disabled={disabled} onAction={onAction} />
+      return (
+        <ExecutorList block={block} disabled={disabled} onAction={onAction} selection={selection} />
+      )
     case 'stage_list':
-      return <StageList block={block} disabled={disabled} onAction={onAction} />
+      return (
+        <StageList block={block} disabled={disabled} onAction={onAction} selection={selection} />
+      )
     case 'operation_list':
-      return <OperationList block={block} disabled={disabled} onAction={onAction} />
+      return (
+        <OperationList block={block} disabled={disabled} onAction={onAction} selection={selection} />
+      )
     case 'conditions':
-      return <Conditions block={block} disabled={disabled} onAction={onAction} />
+      return (
+        <Conditions block={block} disabled={disabled} onAction={onAction} selection={selection} />
+      )
     case 'related_products':
       return <SimpleList block={block} icon="↔" />
     case 'similar_calcs':
@@ -162,13 +166,57 @@ function describeAction(block: Block): string {
   return map[block.text ?? ''] ?? (block.text ?? '')
 }
 
+// ------------------------------------------------- отметки = состояние заявки
+/**
+ * Галочки в карточке — это выбор в заявке, а не собственная память карточки.
+ *
+ * Локальное состояние всё ещё нужно: человек расставляет отметки до нажатия
+ * кнопки, и до этого момента заявка о них не знает. Но как только заявка
+ * меняется — кликом в другой карточке, названным словами пунктом или
+ * восстановлением сессии из базы, — карточка обязана показать записанное.
+ * Без этого выбор был виден только в боковой панели, а карточка в ленте
+ * стояла нетронутой: «справа выбрано, а в диалоге не горит».
+ *
+ * Сравниваем по ключу из идентификаторов, а не по ссылке на массив: снапшот
+ * состояния приходит новым объектом на каждый ход, и по ссылке пересинхрон
+ * случался бы на каждой реплике, затирая незавершённые отметки.
+ */
+function useAppliedSelection(applied: string[] | undefined, items: BlockItem[], initial: string[]) {
+  // Из заявки берём только то, что есть в этой карточке: у списка исполнителей
+  // в истории мог быть свой набор компаний, и чужие идентификаторы сбили бы
+  // счётчик на кнопке.
+  const own = new Set(items.map((i) => i.id))
+  const inBlock = (applied ?? []).filter((id) => own.has(id))
+  const key = inBlock.join('|')
+  const [selected, setSelected] = useState<string[]>(() => (inBlock.length > 0 ? inBlock : initial))
+  const synced = useRef(key)
+
+  useEffect(() => {
+    if (synced.current === key) return
+    synced.current = key
+    // Пустой набор — тоже осмысленное изменение: смена услуги каскадно
+    // сбрасывает этапы и исполнителей (ChatState.ResetFrom), и карточка не
+    // должна показывать отменённый выбор.
+    setSelected(key.length > 0 ? key.split('|') : [])
+  }, [key])
+
+  return { selected, setSelected, applied: inBlock, sameAsApplied: sameIds(selected, inBlock) }
+}
+
+function sameIds(a: string[], b: string[]): boolean {
+  if (a.length !== b.length || a.length === 0) return false
+  const set = new Set(b)
+  return a.every((id) => set.has(id))
+}
+
 // ------------------------------------------------------------------ услуги
 function ProductList({
   block,
   disabled,
   onAction,
-  selectedProductId,
+  selection,
 }: Omit<Props, 'onOpenConstructor'>) {
+  const selectedProductId = selection?.productId
   // tentative приходит с сервера, когда выдача не прошла проверку уверенности
   // (TurnPipeline.Assess). Подавать такие результаты как находку нельзя —
   // именно так пять нерелевантных услуг выглядели уверенным ответом.
@@ -283,13 +331,37 @@ function Clarify({ block }: { block: Block }) {
 }
 
 // ------------------------------------------------------------------ сроки
-function PeriodRequest({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor'>) {
-  const [from, setFrom] = useState<string>(block.meta?.suggestedFrom ?? '')
-  const [to, setTo] = useState<string>(block.meta?.suggestedTo ?? '')
+function PeriodRequest({ block, disabled, onAction, selection }: Omit<Props, 'onOpenConstructor'>) {
+  // Сроки в заявке: названные словами («с октября на три месяца») идут тем же
+  // путём, что и кнопка (ApplyPeriodAsync), поэтому и показывать их карточка
+  // должна одинаково — независимо от того, как их указали.
+  const applied =
+    selection?.period?.from && selection?.period?.to
+      ? { from: selection.period.from, to: selection.period.to }
+      : null
+  const [from, setFrom] = useState<string>(applied?.from ?? block.meta?.suggestedFrom ?? '')
+  const [to, setTo] = useState<string>(applied?.to ?? block.meta?.suggestedTo ?? '')
+
+  // Заявка поменялась — подставляем записанное, не трогая поля, пока человек
+  // сам их правит (ключ не изменился — эффект не сработает).
+  const key = applied ? `${applied.from}|${applied.to}` : ''
+  const synced = useRef(key)
+  useEffect(() => {
+    if (synced.current === key) return
+    synced.current = key
+    if (!applied) return
+    setFrom(applied.from)
+    setTo(applied.to)
+  }, [key])
+
+  const confirmed = !!applied && applied.from === from && applied.to === to
 
   return (
-    <div className="card">
-      <div className="card-title">{block.text}</div>
+    <div className={`card${confirmed ? ' selected' : ''}`}>
+      <div className="card-title">
+        {block.text}
+        {confirmed && <span className="badge ok selected-badge">В заявке</span>}
+      </div>
       {block.meta?.typicalDays && (
         <div className="card-sub">
           Типовая длительность по истории: {block.meta.typicalDays} дн.
@@ -304,10 +376,10 @@ function PeriodRequest({ block, disabled, onAction }: Omit<Props, 'onOpenConstru
         </label>
         <button
           className="btn primary"
-          disabled={disabled || !from || !to}
+          disabled={disabled || !from || !to || confirmed}
           onClick={() => onAction({ type: 'set_period', from, to })}
         >
-          Подобрать исполнителей
+          {confirmed ? 'Сроки записаны' : applied ? 'Изменить сроки' : 'Подобрать исполнителей'}
         </button>
       </div>
     </div>
@@ -322,9 +394,13 @@ const AVAILABILITY: Record<string, string> = {
   overloaded: 'перегружен',
 }
 
-function ExecutorList({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor'>) {
-  const [selected, setSelected] = useState<string[]>([])
+function ExecutorList({ block, disabled, onAction, selection }: Omit<Props, 'onOpenConstructor'>) {
   const items = block.items ?? []
+  const { selected, setSelected, applied, sameAsApplied } = useAppliedSelection(
+    selection?.executorIds,
+    items,
+    [],
+  )
 
   const toggle = (id: string) =>
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
@@ -332,7 +408,12 @@ function ExecutorList({ block, disabled, onAction }: Omit<Props, 'onOpenConstruc
   return (
     <div className="cards">
       {items.map((item: BlockItem) => (
-        <label className={`card selectable ${selected.includes(item.id) ? 'on' : ''}`} key={item.id}>
+        <label
+          className={`card selectable ${selected.includes(item.id) ? 'on' : ''}${
+            applied.includes(item.id) ? ' selected' : ''
+          }`}
+          key={item.id}
+        >
           <div className="card-head">
             <input
               type="checkbox"
@@ -343,6 +424,7 @@ function ExecutorList({ block, disabled, onAction }: Omit<Props, 'onOpenConstruc
             <div>
               <div className="card-title">
                 {item.name}
+                {applied.includes(item.id) && <span className="badge ok selected-badge">В заявке</span>}
                 {item.subcontract && <span className="badge warn">субподряд</span>}
                 {item.isFallback && <span className="badge warn">нет опыта по услуге</span>}
               </div>
@@ -362,7 +444,9 @@ function ExecutorList({ block, disabled, onAction }: Omit<Props, 'onOpenConstruc
       ))}
       <button
         className="btn primary wide"
-        disabled={disabled || selected.length === 0}
+        // Совпадение с заявкой — не повод скрывать кнопку: она остаётся на
+        // месте и просто не кликается, как «Выбрано» у карточки услуги.
+        disabled={disabled || selected.length === 0 || sameAsApplied}
         onClick={() =>
           onAction({
             type: 'select_executors',
@@ -371,16 +455,22 @@ function ExecutorList({ block, disabled, onAction }: Omit<Props, 'onOpenConstruc
           })
         }
       >
-        Выбрать исполнителей ({selected.length})
+        {sameAsApplied
+          ? `Выбрано исполнителей: ${selected.length}`
+          : `Выбрать исполнителей (${selected.length})`}
       </button>
     </div>
   )
 }
 
 // ------------------------------------------------------------------ этапы
-function StageList({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor'>) {
+function StageList({ block, disabled, onAction, selection }: Omit<Props, 'onOpenConstructor'>) {
   const items = block.items ?? []
-  const [selected, setSelected] = useState<string[]>(
+  // Пока этапы в заявку не записаны, карточка стоит на предложении сервера
+  // (preselected); как только записаны — показывает их.
+  const { selected, setSelected, applied, sameAsApplied } = useAppliedSelection(
+    selection?.stageIds,
+    items,
     items.filter((i) => i.preselected).map((i) => i.id),
   )
 
@@ -388,12 +478,25 @@ function StageList({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
 
   return (
-    <div className="card">
-      <div className="card-title">{block.text}</div>
-      <div className="card-sub">Собраны из реальных расчётов по этой услуге</div>
+    <div className={`card${applied.length > 0 ? ' selected' : ''}`}>
+      <div className="card-title">
+        {block.text}
+        {applied.length > 0 && <span className="badge ok selected-badge">В заявке</span>}
+      </div>
+      {/* Почему часть пунктов уже отмечена. Молчащая галочка читается как
+          решение системы за пользователя — а это либо запись в заявке, либо
+          предложение по истории расчётов (preselected = этап встречался
+          больше одного раза, см. StageListBlock). Разница важная, поэтому
+          подпись разная. */}
+      <div className="card-sub">
+        {applied.length > 0
+          ? 'Собраны из реальных расчётов по этой услуге. Отмечены этапы, записанные в заявку.'
+          : 'Собраны из реальных расчётов по этой услуге. Заранее отмечены те, что встречались ' +
+            'в нескольких расчётах, — снимите лишние или отметьте другие.'}
+      </div>
       <ul className="checklist">
         {items.map((item: BlockItem) => (
-          <li key={item.id}>
+          <li key={item.id} className={applied.includes(item.id) ? 'picked' : undefined}>
             <label>
               <input
                 type="checkbox"
@@ -415,18 +518,20 @@ function StageList({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor
       </ul>
       <button
         className="btn primary"
-        disabled={disabled || selected.length === 0}
+        disabled={disabled || selected.length === 0 || sameAsApplied}
         onClick={() => onAction({ type: 'select_stages', ids: selected })}
       >
-        Подтвердить этапы ({selected.length})
+        {sameAsApplied ? `Этапы подтверждены: ${selected.length}` : `Подтвердить этапы (${selected.length})`}
       </button>
     </div>
   )
 }
 
-function OperationList({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor'>) {
+function OperationList({ block, disabled, onAction, selection }: Omit<Props, 'onOpenConstructor'>) {
   const items = block.items ?? []
-  const [selected, setSelected] = useState<string[]>(
+  const { selected, setSelected, applied, sameAsApplied } = useAppliedSelection(
+    selection?.operationIds,
+    items,
     items.filter((i) => i.preselected).map((i) => i.id),
   )
   const [open, setOpen] = useState(false)
@@ -436,14 +541,17 @@ function OperationList({ block, disabled, onAction }: Omit<Props, 'onOpenConstru
 
   return (
     <div className="card">
+      {/* Список свёрнут, поэтому записанное в заявку видно и в заголовке —
+          иначе выбор операций пришлось бы искать, разворачивая карточку. */}
       <button className="collapse" onClick={() => setOpen(!open)}>
         {open ? '▾' : '▸'} {block.text} ({items.length})
+        {applied.length > 0 && <span className="badge ok selected-badge">в заявке: {applied.length}</span>}
       </button>
       {open && (
         <>
           <ul className="checklist">
             {items.map((item: BlockItem) => (
-              <li key={item.id}>
+              <li key={item.id} className={applied.includes(item.id) ? 'picked' : undefined}>
                 <label>
                   <input
                     type="checkbox"
@@ -461,10 +569,10 @@ function OperationList({ block, disabled, onAction }: Omit<Props, 'onOpenConstru
           </ul>
           <button
             className="btn"
-            disabled={disabled}
+            disabled={disabled || sameAsApplied}
             onClick={() => onAction({ type: 'select_operations', ids: selected })}
           >
-            Сохранить операции
+            {sameAsApplied ? 'Операции сохранены' : 'Сохранить операции'}
           </button>
         </>
       )}
@@ -472,24 +580,32 @@ function OperationList({ block, disabled, onAction }: Omit<Props, 'onOpenConstru
   )
 }
 
-function Conditions({ block, disabled, onAction }: Omit<Props, 'onOpenConstructor'>) {
+function Conditions({ block, disabled, onAction, selection }: Omit<Props, 'onOpenConstructor'>) {
+  // Управляемая галочка, а не defaultChecked: условие можно назвать словами
+  // («работы срочные», «допускаем субподряд») — оно попадает в state.Flags, и
+  // карточка должна показать его отмеченным, а не остаться в том виде, в
+  // котором её отрисовали ходом раньше.
+  const flags = selection?.flags
   return (
     <div className="card">
       <div className="card-title">{block.text}</div>
       <ul className="checklist">
-        {(block.items ?? []).map((item: BlockItem) => (
-          <li key={item.key}>
-            <label>
-              <input
-                type="checkbox"
-                defaultChecked={!!item.value}
-                disabled={disabled}
-                onChange={(e) => onAction({ type: 'set_flag', key: item.key, flag: e.target.checked })}
-              />
-              <span>{item.title}</span>
-            </label>
-          </li>
-        ))}
+        {(block.items ?? []).map((item: BlockItem) => {
+          const on = flags ? flags.includes(item.key) : !!item.value
+          return (
+            <li key={item.key} className={on ? 'picked' : undefined}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={on}
+                  disabled={disabled}
+                  onChange={(e) => onAction({ type: 'set_flag', key: item.key, flag: e.target.checked })}
+                />
+                <span>{item.title}</span>
+              </label>
+            </li>
+          )
+        })}
       </ul>
     </div>
   )
